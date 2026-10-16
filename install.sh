@@ -19,6 +19,10 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+if [ -n "$agents" ] && ! command -v launchctl >/dev/null 2>&1; then
+  echo "$0: --agent is macOS-only (no launchctl); on Linux run the bridge in a terminal, tmux or a systemd user service" >&2
+  exit 1
+fi
 mkdir -p "$data"
 chmod 700 "$data"
 cp "$root/fm_telegram.py" "$root/oss_watch.py" "$data/"

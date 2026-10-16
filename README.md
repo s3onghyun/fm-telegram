@@ -35,6 +35,8 @@ macOS is the primary platform (Keychain, LaunchAgents, `afconvert`). The bridge 
 
 ## Setup
 
+On Linux, skip the `security` command in step 2 and export `FM_TELEGRAM_BOT_TOKEN` instead, and in step 6 run the bridge in a terminal, tmux or a systemd user service: `./install.sh --agent` is macOS-only. To try the bridge without Telegram first, see [Try it without Telegram](#try-it-without-telegram).
+
 1. **Create a bot.** In Telegram, talk to [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token. Send any message to your new bot so it has something to deliver.
 
 2. **Store the token.** On macOS, put it in the login Keychain. With `-w` last and no value, `security` prompts for the token, so it never lands in your shell history:
@@ -72,7 +74,7 @@ macOS is the primary platform (Keychain, LaunchAgents, `afconvert`). The bridge 
    # ... WARNING ignored Telegram message from chat id=123456789
    ```
 
-   Stop it with Ctrl-C, put that number in `owner_chat_id`, and start it again. Use your **private** chat with the bot: in a group, every member could create notes.
+   Stop it with Ctrl-C, put that number in `owner_chat_id`, and start it again. Use your **private** chat with the bot: in a group, every member could create notes. The message you sent to find the id does not become a note; send a new one after restarting.
 
 6. **Keep it running.** Run it in a terminal, tmux or a Herdr pane:
 
@@ -80,7 +82,7 @@ macOS is the primary platform (Keychain, LaunchAgents, `afconvert`). The bridge 
    python3 ~/.local/share/fm-telegram/fm_telegram.py run
    ```
 
-   Or, on macOS, load it as a per-user LaunchAgent (logs go to `~/Library/Logs/fm-telegram.log`):
+   Or, on macOS only, load it as a per-user LaunchAgent (logs go to `~/Library/Logs/fm-telegram.log`). Without `launchctl`, `install.sh --agent` stops with an error before installing anything:
 
    ```sh
    ./install.sh --agent bridge
@@ -143,7 +145,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 |------|------|----------|
 | `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram. |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt). |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
 
@@ -207,6 +209,26 @@ python3 -m unittest discover -s tests -v
 ```
 
 `tests/test_end_to_end.py` runs the real HTTP client against `tests/fake_telegram_api.py`, a local stand-in for the Bot API that you can also start by hand (`python3 tests/fake_telegram_api.py --token <any> --port 8765`) and point `api_base` at.
+
+### Try it without Telegram
+
+Run the whole flow on your machine against the fake Bot API, with a fake token and a Firstmate home:
+
+```sh
+export FM_TELEGRAM_BOT_TOKEN=123:fake
+python3 tests/fake_telegram_api.py --token "$FM_TELEGRAM_BOT_TOKEN" --port 18765 &
+```
+
+Write the config as in setup step 4 with `"owner_chat_id": 1`, and add `"api_base": "http://127.0.0.1:18765"` and `"doorbell": false`. Then start the bridge, queue a message from chat 1 and read what the bridge sent back:
+
+```sh
+python3 ~/.local/share/fm-telegram/fm_telegram.py run &
+curl -X POST localhost:18765/_control/updates \
+  -d '{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":1,"type":"private"},"text":"hi"}}'
+curl localhost:18765/_control/sent
+```
+
+`fm-inbox.sh list` in your Firstmate home now shows the `hi` note.
 
 ## Tested
 

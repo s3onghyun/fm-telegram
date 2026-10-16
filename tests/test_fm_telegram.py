@@ -237,8 +237,49 @@ class BridgeTests(unittest.TestCase):
         item = update(44, OWNER, "same task")
         self.bridge.process_update(item)
         self.bridge.process_update(item)
-        self.assertEqual([("tg:44", "same task"), ("tg:44", "same task")], self.inbox.requests)
+        self.assertEqual([("tg:44", "same task")], self.inbox.requests)
         self.assertEqual(["note-tg:44"], self.state.data["telegram_note_ids"])
+        self.assertEqual([(OWNER, "Received. Note ID: note-tg:44")], self.api.sent)
+
+    def test_replayed_attachment_is_not_downloaded_again(self):
+        self.api.files["large"] = ("photos/file_7.jpg", b"jpeg-bytes")
+        item = media_update(77, OWNER, "screen", photo=PHOTO_SIZES)
+        self.bridge.process_update(item)
+        self.bridge.state = fm.State(self.state.directory)  # As after a restart.
+        self.bridge.process_update(item)
+        self.assertEqual(["large"], self.api.file_requests)
+        self.assertEqual(1, len(self.api.sent))
+
+    def test_status_hides_local_paths(self):
+        home = Path(self.temp.name) / "fm"
+        script = home / "bin/fm-inbox.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text('#!/bin/sh\necho "home     $FM_HOME"\necho "user     %s/x"\n' % Path.home())
+        script.chmod(0o700)
+        self.assertEqual("home     $FM_HOME\nuser     ~/x\n", fm.Inbox(home).status())
+
+    def test_missing_transcription_binary_is_named_in_log(self):
+        def missing(_path):
+            raise FileNotFoundError(2, "No such file or directory", "/usr/bin/afconvert")
+        self.bridge.transcriber = missing
+        self.api.files["v3"] = ("voice/file_5.oga", b"opus")
+        voice = {"file_id": "v3", "file_unique_id": "u-v3", "file_size": 4}
+        self.bridge.process_update(media_update(92, OWNER, voice=voice))
+        self.assertIn("FileNotFoundError (/usr/bin/afconvert)", self.stream.getvalue())
+
+    def test_install_agent_without_launchctl_fails_cleanly(self):
+        root = Path(fm.__file__).resolve().parent
+        tools, home = Path(self.temp.name) / "tools", Path(self.temp.name) / "home"
+        tools.mkdir()
+        home.mkdir()
+        (tools / "dirname").symlink_to(subprocess.check_output(["sh", "-c", "command -v dirname"],
+                                                               text=True).strip())
+        result = subprocess.run(["/bin/sh", str(root / "install.sh"), "--agent", "bridge"],
+                                env={"PATH": str(tools), "HOME": str(home)}, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("macOS-only", result.stderr)
+        self.assertEqual([], list(home.rglob("*")))
 
     def test_replay_does_not_ring_doorbell(self):
         herdr, clock = FakeHerdr(), Clock()
@@ -361,7 +402,9 @@ class SecurityTests(unittest.TestCase):
 
     def test_redactor_hides_bot_tokens_literal_secrets_and_private_keys(self):
         redactor = fm.Redactor(secrets=["s3cr3t-literal"])
-        text = redactor.redact("bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawZ s3cr3t-literal "
+        # Built at runtime so no token-shaped literal is committed for secret scanners to flag.
+        bot_token = "123456789:" + "x" * 35
+        text = redactor.redact("bot " + bot_token + " s3cr3t-literal "
                                "github_pat_ABCDEFGH123 -----BEGIN RSA PRIVATE KEY-----\nabc\n"
                                "-----END RSA PRIVATE KEY----- tail")
         self.assertEqual("bot [redacted] [redacted] [redacted] [redacted] tail", text)
