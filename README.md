@@ -129,6 +129,8 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `whisper_model` | `~/.local/share/fm-telegram/models/ggml-large-v3-turbo-q5_0.bin` | whisper.cpp model file. |
 | `whisper_language` | `"auto"` | Language passed to `whisper-cli -l`, such as `"en"` or `"ko"`. |
 | `transcript_prefixes` | `[]` | Words whose spoken form "word, …" is rewritten to "word: …", so a dictated `todo: buy milk` matches a typed one. |
+| `fleet_alerts` | `false` | Send alerts from Firstmate's fleet ledger (below). |
+| `fleet_alert_labels` | `{}` | Replace alert labels, keyed `pr_ready`, `needs-decision`, `blocked`, `failed`, `done`. |
 | `oss_watch` | — | Settings for the optional GitHub watcher (below). |
 
 | Environment variable | Meaning |
@@ -145,7 +147,8 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 |------|------|----------|
 | `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt). |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt) and, with `fleet_alerts`, the fleet ledger offset. |
+| `…/sent-prs.txt` | 0600 | With `fleet_alerts`: PR URLs already sent to you, one per line. Never pruned. |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
 
@@ -165,6 +168,28 @@ curl -fL -o ~/.local/share/fm-telegram/models/ggml-large-v3-turbo-q5_0.bin \
 ```
 
 On Apple Silicon, a 7-second clip takes about 7 s on the first run (model loading) and about 1 s afterwards. Set `whisper_language` if auto-detection guesses wrong for short clips.
+
+## Optional: fleet alerts
+
+Without this, news about Firstmate's tasks reaches your phone only when the Firstmate session is in a turn and calls `notify`. With `"fleet_alerts": true` the bridge reads [Firstmate's fleet activity ledger](https://github.com/kunchenguid/firstmate/blob/main/docs/fleet-ledger.md) (`<firstmate_home>/state/fleet-ledger.jsonl`) itself on every poll. Alerts arrive even while Firstmate is idle or disconnected.
+
+1. Turn the ledger on in the Firstmate home: `touch <firstmate_home>/config/fleet-ledger`.
+2. Add `"fleet_alerts": true` to the config and restart the bridge.
+
+| Ledger record | Alert |
+|---------------|-------|
+| `task.pr_ready` | `✅ PR ready for review · <task>` and the PR URL |
+| `task.status`, state `needs-decision` | `❓ Decision needed · <task>` and the status text |
+| `task.status`, state `blocked` | `⛔ Blocked · <task>` and the status text |
+| `task.status`, state `failed` | `❌ Failed · <task>` and the status text |
+| `task.status`, state `done` | `🏁 Finished · <task>` and the status text (a finished investigation, or a worker's PR) |
+
+Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, cleanups and unknown events are skipped. Status text is cut to 600 characters, then redacted and sent like any other message. To change the wording, set `fleet_alert_labels`, for example `{"blocked": "⛔ 막힘"}`.
+
+- **No history flood, no repeats.** On the first poll after you enable it, the bridge starts at the end of the ledger. After that it saves a byte offset in `state.json` after each record, so a restart continues where it stopped. If the ledger is truncated, it is read again from its start. A partial last line waits for its newline.
+- **One notice per PR.** A PR URL is sent once. A worker's `done: PR <url>` line usually arrives first, so the later `task.pr_ready` for the same URL is skipped, and so is a re-registration. While `fleet_alerts` is on, `notify` also records the PR URLs in its text: if Firstmate tells you about a PR first, the ledger alert for it is skipped.
+- **Possible double notices.** Other events have no shared key. If Firstmate also sends a `notify` for a blocker, a decision or a PR it learned about after the alert, you get both. The ledger is at-least-once, so a rare repeated record can also repeat an alert.
+- **Trust.** The ledger copies status text verbatim from Firstmate's `state/`. Workers write those lines, and the alert is only as private as they are.
 
 ## Optional: GitHub activity watcher
 

@@ -368,6 +368,7 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(OWNER, config["owner_chat_id"])
         self.assertTrue(config["doorbell"])
         self.assertEqual("auto", config["whisper_language"])
+        self.assertFalse(config["fleet_alerts"])
         for bad in ({}, {"owner_chat_id": "424242"}, {"owner_chat_id": True}):
             with self.assertRaises(RuntimeError):
                 fm.load_config(self.write_config(bad))
@@ -468,6 +469,123 @@ class FormattingTests(unittest.TestCase):
         self.assertTrue(all(len(part) <= fm.TELEGRAM_LIMIT for part in parts))
         self.assertTrue(all(part.startswith("<b>") and part.endswith("</b>") for part in parts))
         self.assertEqual(fm._plain_html(rendered), "".join(fm._plain_html(part) for part in parts))
+
+
+PR = "https://github.com/acme/webapp/pull/7"
+
+
+def ledger_line(event, task="fix-login", **members):
+    return json.dumps({"v": 1, "ts": 1790132857, "event": event, "task": task, **members}) + "\n"
+
+
+def status_line(state, text, task="fix-login"):
+    return ledger_line("task.status", task, state=state, key=None, text=text)
+
+
+class FleetAlertTests(unittest.TestCase):
+    """A fake Firstmate home's state/fleet-ledger.jsonl, appended to as Firstmate would."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.ledger = root / "home/state/fleet-ledger.jsonl"
+        self.ledger.parent.mkdir(parents=True)
+        self.state_dir = root / "state"
+        self.api = FakeTelegram()
+        self.bridge = self.restart()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def restart(self, labels=None):
+        state = fm.State(self.state_dir)
+        fleet = fm.FleetAlerts(self.ledger, state, labels)
+        return fm.Bridge(self.api, FakeInbox(), state, OWNER, fm.Redactor(secrets=["s3cr3t-term"]),
+                         logging.getLogger("fleet-test"), fleet=fleet)
+
+    def append(self, *lines):
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write("".join(lines))
+
+    def poll(self):
+        self.api.sent.clear()
+        self.bridge.once()
+        return [fm._plain_html(text) for _chat, text in self.api.sent]
+
+    def test_first_enable_skips_history_and_restart_never_repeats(self):
+        self.append(status_line("blocked", " old news"))
+        self.assertEqual([], self.poll())
+        self.append(ledger_line("task.pr_ready", pr=PR))
+        self.assertEqual(["✅ PR ready for review · fix-login\n" + PR], self.poll())
+        self.bridge = self.restart()
+        self.assertEqual([], self.poll())
+
+    def test_ledger_created_after_enable_is_read_from_its_start(self):
+        self.assertEqual([], self.poll())
+        self.append(status_line("needs-decision", " pick A or B"))
+        self.assertEqual(["❓ Decision needed · fix-login\npick A or B"], self.poll())
+
+    def test_only_captain_relevant_events_alert(self):
+        self.poll()
+        self.append(ledger_line("task.dispatched", kind="ship", project="webapp", harness="claude",
+                                model=None),
+                    status_line("working", " bug reproduced"), status_line("paused", " CI"),
+                    status_line("resolved", " answered"), status_line(None, "no state"),
+                    ledger_line("task.merged", via="pr", pr=PR), ledger_line("task.cleaned_up"),
+                    ledger_line("task.future_event"), "not json\n", "[]\n",
+                    status_line("blocked", " need a second checkout"),
+                    status_line("failed", " tests crash", task="scout-1"),
+                    status_line("done", " report in data/scout-1/report.md", task="scout-1"))
+        self.assertEqual(["⛔ Blocked · fix-login\nneed a second checkout",
+                          "❌ Failed · scout-1\ntests crash",
+                          "🏁 Finished · scout-1\nreport in data/scout-1/report.md"], self.poll())
+
+    def test_partial_line_waits_for_its_newline(self):
+        self.poll()
+        line = status_line("blocked", " half")
+        self.append(line[:20])
+        self.assertEqual([], self.poll())
+        self.append(line[20:])
+        self.assertEqual(["⛔ Blocked · fix-login\nhalf"], self.poll())
+
+    def test_pr_is_announced_once_across_done_reregistration_and_notify(self):
+        self.poll()
+        self.append(status_line("blocked", " CI red on " + PR), status_line("done", " PR " + PR),
+                    ledger_line("task.pr_ready", pr=PR), ledger_line("task.pr_ready", pr=PR))
+        self.assertEqual(["⛔ Blocked · fix-login\nCI red on " + PR,
+                          "🏁 Finished · fix-login\nPR " + PR], self.poll())
+        other = "https://gitlab.example.com/group/app/-/merge_requests/12"
+        self.bridge.fleet.remember("PR ready: %s, please review" % other)  # as `notify` does
+        self.append(ledger_line("task.pr_ready", task="app", pr=other))
+        self.assertEqual([], self.poll())
+
+    def test_truncated_ledger_is_read_again_from_the_start(self):
+        self.append(status_line("working", " " + "x" * 200))
+        self.poll()
+        self.ledger.write_text(status_line("failed", " after truncation"))
+        self.assertEqual(["❌ Failed · fix-login\nafter truncation"], self.poll())
+
+    def test_alerts_are_redacted_capped_and_relabelled(self):
+        self.bridge = self.restart(labels={"blocked": "⛔ 막힘 (blocked)"})
+        self.poll()
+        token = "123456789:" + "A" * 35
+        self.append(status_line("blocked", " leaked %s and s3cr3t-term " % token + "y" * 2000))
+        [alert] = self.poll()
+        self.assertTrue(alert.startswith("⛔ 막힘 (blocked) · fix-login\nleaked [redacted] and [redacted] "))
+        self.assertNotIn(token, alert)
+        self.assertLess(len(alert), fm.MAX_ALERT_TEXT + 100)
+
+    def test_failed_send_keeps_the_cursor_so_the_alert_is_retried(self):
+        self.poll()
+        self.append(status_line("blocked", " retry me"))
+        def offline(*_args, **_kwargs):
+            raise RuntimeError("Telegram network request failed")
+        with patch.object(self.api, "send", offline), self.assertRaises(RuntimeError):
+            self.bridge.once()
+        self.assertEqual(["⛔ Blocked · fix-login\nretry me"], self.poll())
+
+    def test_sent_pr_file_is_private(self):
+        self.bridge.fleet.remember(PR)
+        self.assertEqual(0o600, self.bridge.fleet.sent_path.stat().st_mode & 0o777)
 
 
 class DoorbellTests(unittest.TestCase):
