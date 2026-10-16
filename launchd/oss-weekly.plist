@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install.sh replaces the @...@ placeholders. A per-user agent, never a root daemon. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>@LABEL@.oss-weekly</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>Umask</key><integer>63</integer>
+  <key>ProgramArguments</key><array><string>@PYTHON@</string><string>@DATA_DIR@/oss_watch.py</string><string>weekly</string></array>
+  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>@LOG_DIR@/oss-weekly.log</string>
+  <key>StandardErrorPath</key><string>@LOG_DIR@/oss-weekly.log</string>
+</dict></plist>
