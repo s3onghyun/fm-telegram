@@ -32,6 +32,7 @@ DEFAULT_CONFIG = _xdg("XDG_CONFIG_HOME", ".config") / "fm-telegram/config.json"
 DEFAULT_STATE = _xdg("XDG_STATE_HOME", ".local/state") / "fm-telegram"
 DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share") / "fm-telegram"
 TOKEN_ENV = "FM_TELEGRAM_BOT_TOKEN"
+MAX_HANDLED_UPDATES = 1000
 CONFIG_DEFAULTS: dict[str, Any] = {
     "owner_chat_id": None,
     "firstmate_home": None,
@@ -455,7 +456,8 @@ class Inbox:
         return Note(note_id, created=created)
 
     def status(self) -> str:
-        return self._run(["status"])
+        # Status goes to Telegram, so local paths are shortened (README: no private paths).
+        return self._run(["status"]).replace(str(self.home), "$FM_HOME").replace(str(Path.home()), "~")
 
     def receipts(self, cursor: str) -> dict[str, Any]:
         output = self._run(["receipts", "--after", cursor]) if cursor else self._run(["receipts"])
@@ -600,6 +602,8 @@ class Bridge:
             if isinstance(chat_id, int):
                 self.log.warning("ignored Telegram message from chat id=%d", chat_id)
             return
+        if update_id in self.state.data.get("handled_update_ids", []):
+            return  # A replayed update: no second download, transcription or receipt.
         text = message.get("text")
         if not isinstance(text, str):
             try:
@@ -672,8 +676,10 @@ class Bridge:
             try:
                 transcript = self.transcriber(target).strip() if self.transcriber else ""
             except (OSError, subprocess.SubprocessError) as exc:
-                self.log.warning("voice transcription failed for update id=%d: %s",
-                                 update_id, type(exc).__name__)
+                # filename names the missing binary on FileNotFoundError; never message text.
+                self.log.warning("voice transcription failed for update id=%d: %s%s", update_id,
+                                 type(exc).__name__, " (%s)" % exc.filename
+                                 if getattr(exc, "filename", None) else "")
                 transcript = ""
             # Whisper renders a spoken colon as a comma ("todo, buy milk"); restore it for the
             # configured prefixes so a spoken "todo: ..." reads exactly like a typed one.
@@ -708,6 +714,9 @@ class Bridge:
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
         note_id = note.id
+        handled = self.state.data.setdefault("handled_update_ids", [])
+        handled[:] = (handled + [update_id])[-MAX_HANDLED_UPDATES:]
+        self.state.save()
         known = self.state.data.setdefault("telegram_note_ids", [])
         if note_id not in known:
             known.append(note_id)
