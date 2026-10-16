@@ -46,6 +46,8 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "whisper_model": str(DATA_DIR / "models/ggml-large-v3-turbo-q5_0.bin"),
     "whisper_language": "auto",
     "transcript_prefixes": [],
+    "fleet_alerts": False,
+    "fleet_alert_labels": {},
 }
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
@@ -70,6 +72,11 @@ TOKEN_PATTERNS = (
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL),
 )
+# Captain-relevant fleet ledger events (docs/fleet-ledger.md in Firstmate) and their alert labels.
+FLEET_LABELS = {"pr_ready": "✅ **PR ready for review**", "needs-decision": "❓ **Decision needed**",
+                "blocked": "⛔ **Blocked**", "failed": "❌ **Failed**", "done": "🏁 **Finished**"}
+MAX_ALERT_TEXT = 600
+PR_URL = re.compile(r"https?://[^\s<>()\[\]]+/(?:pull|merge_requests)/\d+")
 HTML_TAG = re.compile(r"</?[^>]+>")
 FENCE = re.compile(r"^```([A-Za-z0-9_+-]*)\s*$")
 TABLE_DIVIDER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
@@ -558,12 +565,91 @@ class Doorbell:
             self.log.warning("doorbell unavailable for note id=%s", note_id)
 
 
+class FleetAlerts:
+    """Follow Firstmate's fleet ledger and turn captain-relevant records into alerts."""
+    def __init__(self, ledger: Path, state: State, labels: Optional[dict[str, str]] = None) -> None:
+        self.ledger, self.state = ledger, state
+        self.labels = {**FLEET_LABELS, **(labels or {})}
+        # PR URLs already told to the owner, by an alert or by `notify`; appended by both processes.
+        # shortcut: never pruned (one short line per PR), trim by hand if it ever matters.
+        self.sent_path = state.directory / "sent-prs.txt"
+
+    def sent(self) -> set[str]:
+        try:
+            return set(self.sent_path.read_text(encoding="utf-8").split())
+        except FileNotFoundError:
+            return set()
+
+    def remember(self, text: str) -> None:
+        urls = PR_URL.findall(text)
+        if urls:
+            descriptor = os.open(self.sent_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                                 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                handle.write("".join(url + "\n" for url in urls))
+
+    def alert(self, record: Any) -> tuple[Optional[str], list[str]]:
+        """Return one ledger record's alert text (None when not captain-relevant) and its PR URLs."""
+        if not isinstance(record, dict) or not isinstance(record.get("task"), str):
+            return None, []
+        event, task = record.get("event"), record["task"]
+        if event == "task.pr_ready" and isinstance(record.get("pr"), str):
+            key, body = "pr_ready", record["pr"]
+        elif event == "task.status" and record.get("state") in FLEET_LABELS \
+                and isinstance(record.get("text"), str):
+            key, body = record["state"], record["text"].strip()
+        else:
+            return None, []
+        if len(body) > MAX_ALERT_TEXT:
+            body = body[:MAX_ALERT_TEXT] + "…"
+        # Only a finished or ready PR counts as told; a blocker that mentions one does not.
+        urls = PR_URL.findall(body) if key in ("pr_ready", "done") else []
+        # A PR the owner already heard about (worker done line, re-registration, notify) is not repeated.
+        if urls and set(urls) <= self.sent():
+            return None, []
+        return "%s · %s\n%s" % (self.labels[key], task, body), urls
+
+    def poll(self, send: Callable[[str], None]) -> None:
+        try:
+            size = self.ledger.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if "ledger_offset" not in self.state.data:
+            # First enable: start at the end, never replay history.
+            self.state.data["ledger_offset"] = size
+            self.state.save()
+            return
+        offset = int(self.state.data["ledger_offset"])
+        if size < offset:
+            offset = 0  # Truncated (`: > state/fleet-ledger.jsonl`); later records start at 0.
+        if size == offset:
+            return
+        with self.ledger.open("rb") as handle:
+            handle.seek(offset)
+            pending = handle.read(size - offset)
+        # A partial last line waits for its newline.
+        for line in pending.splitlines(keepends=True):
+            if not line.endswith(b"\n"):
+                break
+            try:
+                text, urls = self.alert(json.loads(line))
+            except ValueError:
+                text, urls = None, []
+            if text:
+                send(text)
+                self.remember(" ".join(urls))
+            offset += len(line)
+            self.state.data["ledger_offset"] = offset
+            self.state.save()
+
+
 class Bridge:
     def __init__(self, api: Any, inbox: Any, state: State, owner_chat_id: int,
                  redactor: Redactor, logger: logging.Logger,
                  doorbell: Optional[Doorbell] = None,
                  transcriber: Optional[Callable[[Path], str]] = None,
-                 transcript_prefixes: Iterable[str] = ()) -> None:
+                 transcript_prefixes: Iterable[str] = (),
+                 fleet: Optional[FleetAlerts] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -571,6 +657,7 @@ class Bridge:
         self.doorbell = doorbell
         self.transcriber = transcriber
         self.transcript_prefixes = list(transcript_prefixes)
+        self.fleet = fleet
 
     def send(self, text: str) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
@@ -749,6 +836,8 @@ class Bridge:
         if self.doorbell:
             self.doorbell.flush()
         self.check_replies()
+        if self.fleet:
+            self.fleet.poll(self.send)
 
     def run(self, interval: float) -> None:
         delay = 1.0
@@ -792,10 +881,12 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     doorbell = Doorbell(home, bool(config["doorbell"]), logger, agent=config["doorbell_agent"])
     whisper = str(config["whisper_cli"] or shutil.which("whisper-cli") or "whisper-cli")
     model, language = _path(config["whisper_model"]), str(config["whisper_language"])
+    fleet = FleetAlerts(home / "state/fleet-ledger.jsonl", state,
+                        config["fleet_alert_labels"]) if config["fleet_alerts"] else None
     bridge = Bridge(TelegramAPI(token, base=config["api_base"]), Inbox(home), state,
                     config["owner_chat_id"], redactor, logger, doorbell,
                     transcriber=lambda path: transcribe(path, whisper, model, language),
-                    transcript_prefixes=config["transcript_prefixes"])
+                    transcript_prefixes=config["transcript_prefixes"], fleet=fleet)
     return bridge, config
 
 
@@ -813,7 +904,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     bridge, config = build_bridge(args)
     if args.command == "notify":
-        bridge.send(sys.stdin.read() if args.text == "-" else args.text)
+        text = sys.stdin.read() if args.text == "-" else args.text
+        bridge.send(text)
+        if bridge.fleet:
+            bridge.fleet.remember(text)
         return 0
     def stop(_signum: int, _frame: Any) -> None:
         bridge.stopping = True
