@@ -131,6 +131,13 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `transcript_prefixes` | `[]` | Words whose spoken form "word, …" is rewritten to "word: …", so a dictated `todo: buy milk` matches a typed one. |
 | `fleet_alerts` | `false` | Send alerts from Firstmate's fleet ledger (below). |
 | `fleet_alert_labels` | `{}` | Replace alert labels, keyed `pr_ready`, `needs-decision`, `blocked`, `failed`, `done`. |
+| `main_stall_alerts` | `false` | Alert when a pending captain note exceeds the threshold or the Firstmate watcher is reported down. |
+| `main_stall_threshold_seconds` | `600` | Pending-note age that triggers the main-stall alert. |
+| `claude_probe` | `false` | Run the bounded Claude login/response probe below. |
+| `claude_probe_interval_seconds` | `3600` | Time between completed Claude probes. |
+| `claude_probe_timeout_seconds` | `90` | Maximum time for one Claude probe before it is killed and reported as hung. |
+| `claude_probe_command` | `["claude", "-p", "reply OK", "--tools", ""]` | Command array for the no-tool probe. |
+| `claude_auth_status_command` | `["claude", "auth", "status"]` | Command array checked after a failed probe for a logged-out state. |
 | `oss_watch` | — | Settings for the optional GitHub watcher (below). |
 
 | Environment variable | Meaning |
@@ -190,6 +197,30 @@ Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, clea
 - **One notice per PR.** A PR URL is sent once. A worker's `done: PR <url>` line usually arrives first, so the later `task.pr_ready` for the same URL is skipped, and so is a re-registration. While `fleet_alerts` is on, `notify` also records the PR URLs in its text: if Firstmate tells you about a PR first, the ledger alert for it is skipped.
 - **Possible double notices.** Other events have no shared key. If Firstmate also sends a `notify` for a blocker, a decision or a PR it learned about after the alert, you get both. The ledger is at-least-once, so a rare repeated record can also repeat an alert.
 - **Trust.** The ledger copies status text verbatim from Firstmate's `state/`. Workers write those lines, and the alert is only as private as they are.
+
+## Optional: main and Claude health checks
+
+Both health checks are off by default.
+Enable them only for a Firstmate home whose bridge can already read its public `fm-inbox.sh` commands.
+
+```json
+{
+  "main_stall_alerts": true,
+  "main_stall_threshold_seconds": 600,
+  "claude_probe": true,
+  "claude_probe_interval_seconds": 3600,
+  "claude_probe_timeout_seconds": 90
+}
+```
+
+With `main_stall_alerts`, the bridge calls `fm-inbox.sh receipts --all-pending`, `ready`, and `status` on its normal polling loop.
+It alerts once when the oldest pending captain note has exceeded the threshold or the public status reports that the watcher is down, then sends one recovery notice after both conditions clear.
+The episode state is kept in the bridge state file, so restarting the bridge does not repeat an active alert.
+
+With `claude_probe`, the bridge starts the configured `claude -p` command in a background thread at the configured interval.
+The command has no tools by default and is killed at its timeout, so it never pauses Telegram polling.
+A failed command that mentions login/authentication, or whose `claude auth status` output says `loggedIn: false`, sends `로그인 필요` with the `claude auth login` hint.
+A timeout sends `Claude 멈춤`; every failure type sends one alert and one recovery notice when a later probe succeeds.
 
 ## Optional: GitHub activity watcher
 
