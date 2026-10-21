@@ -563,10 +563,10 @@ def _watcher_is_down(status: str, ready: dict[str, Any]) -> bool:
     text = status.lower()
     if "watcher still down" in text or re.search(r"\bwatcher\b[^\n]{0,80}\bdown\b", text):
         return True
-    watcher = ready.get("watcher")
-    if isinstance(watcher, dict) and str(watcher.get("state", "")).lower() == "down":
+    wake_consumer = ready.get("wake_consumer")
+    if isinstance(wake_consumer, dict) and str(wake_consumer.get("state", "")).lower() == "down":
         return True
-    return str(ready.get("watcher_state", "")).lower() == "down"
+    return ready.get("can_receive") is False
 
 
 class MainStallCheck:
