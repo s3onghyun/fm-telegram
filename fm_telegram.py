@@ -55,7 +55,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "claude_probe": False,
     "claude_probe_interval_seconds": 3600,
     "claude_probe_timeout_seconds": 90,
-    "claude_probe_command": ["claude", "-p", "reply OK", "--tools", ""],
+    "claude_probe_command": ["claude", "auth", "status"],
     "claude_auth_status_command": ["claude", "auth", "status"],
 }
 TELEGRAM_LIMIT = 4096
@@ -607,12 +607,14 @@ LOGGED_OUT = re.compile(r"logged[_ ]?in[^a-z]{0,20}false|not\s+logged\s+in", re.
 
 
 def classify_probe(returncode: int, output: str, timed_out: bool = False,
-                   auth_status: str = "") -> ProbeResult:
+                   auth_status: str = "", auth_command_failure: bool = False) -> ProbeResult:
     if timed_out:
         return ProbeResult("hang")
+    if LOGGED_OUT.search(output) or LOGGED_OUT.search(auth_status):
+        return ProbeResult("auth")
     if returncode == 0:
         return ProbeResult("ok")
-    if AUTH_FAILURE.search(output) or LOGGED_OUT.search(auth_status):
+    if auth_command_failure or AUTH_FAILURE.search(output):
         return ProbeResult("auth")
     return ProbeResult("error")
 
@@ -636,7 +638,8 @@ def run_claude_probe(command: list[str], timeout: float,
             auth_status = (auth.stdout or "") + "\n" + (auth.stderr or "")
         except (OSError, subprocess.TimeoutExpired):
             pass
-    return classify_probe(result.returncode, output, auth_status=auth_status)
+    return classify_probe(result.returncode, output, auth_status=auth_status,
+                          auth_command_failure=bool(result.returncode and command == auth_command))
 
 
 class ClaudeProbeCheck:
