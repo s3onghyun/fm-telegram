@@ -128,15 +128,29 @@ This sends one [inline keyboard](https://core.telegram.org/bots/api#inlinekeyboa
 Each permitted press arrives as a Telegram
 [callback query](https://core.telegram.org/bots/api#callbackquery); the bridge accepts it only
 when the callback message is in `owner_chat_id`, calls
-[answerCallbackQuery](https://core.telegram.org/bots/api#answercallbackquery), and replaces that
-question's row with its checked selection through
+[answerCallbackQuery](https://core.telegram.org/bots/api#answercallbackquery) with a visible
+toast (`받았어요 ✓ 1b`, `이미 받았어요`, or an expiry hint), and replaces that question's row
+with its `✅` selection through
 [editMessageReplyMarkup](https://core.telegram.org/bots/api#editmessagereplymarkup). It creates
 one inbox note immediately per selected question, such as `Decision reply to Ab3dEf: 1b`, followed
 by the question and label. A selected row is locked, so there is no extra **send** button.
 
-Pending choices are private bridge state and expire after seven days. A replayed callback uses its
-Telegram callback id as the stable inbox request id, so retries do not create a second note.
-Plain `notify` calls are unchanged.
+Pending choices are held in a separate private, atomically-written state file and expire after
+seven days. The running bridge reads that file fresh for each callback, so a concurrent `notify`
+cannot be overwritten by the polling state save. A replayed callback uses its Telegram callback id
+as the stable inbox request id, so retries do not create a second note. Plain `notify` calls are
+unchanged.
+
+### Verify a decision button after deploy
+
+This safe live check sends one test button only to the configured owner chat. Press it and confirm
+that Telegram shows `받았어요 ✓ 1b`, the button gains `✅`, and a matching Firstmate inbox note
+appears.
+
+```sh
+python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Button delivery check' \
+  --choice '1:b=Received'
+```
 
 Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries, and if Telegram rejects the formatting the same part is resent as plain text. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
 
@@ -183,7 +197,8 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 |------|------|----------|
 | `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), pending inline-choice state (for up to seven days), and, with `fleet_alerts`, the fleet ledger offset. |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), and, with `fleet_alerts`, the fleet ledger offset. Saves merge only changed keys under a lock so another process cannot erase them. |
+| `…/pending-choices.json` | 0600 | Pending inline-choice state (for up to seven days), written atomically by `notify` and read fresh for every callback. |
 | `…/sent-prs.txt` | 0600 | With `fleet_alerts`: PR URLs already sent to you, one per line. Never pruned. |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
