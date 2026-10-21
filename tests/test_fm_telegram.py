@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -437,6 +438,68 @@ class SecurityTests(unittest.TestCase):
             fm.TelegramAPI(token, opener).send(OWNER, "<b>x", parse_mode="HTML")
         self.assertNotIn(token, str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
+
+
+class HealthCheckTests(unittest.TestCase):
+    class Inbox:
+        def __init__(self, pending=None, status="", ready=None):
+            self._pending, self._status = pending or [], status
+            self._ready = ready or {}
+
+        def pending(self):
+            return self._pending
+
+        def status(self):
+            return self._status
+
+        def ready(self):
+            return self._ready
+
+    def test_pending_receipts_and_ready_use_public_inbox_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "bin/fm-inbox.sh"
+            script.parent.mkdir()
+            script.write_text("#!/bin/sh\ncase \"$1 $2\" in\n"
+                              "'receipts --all-pending') echo '{\"pending\":[{\"at\":\"2026-01-01T00:00:00Z\"}]}' ;;\n"
+                              "'ready ') echo '{\"watcher\":{\"state\":\"down\"}}' ;;\n"
+                              "'status ') echo 'watcher still down' ;;\nesac\n")
+            script.chmod(0o700)
+            inbox = fm.Inbox(root)
+            self.assertEqual(1, len(inbox.pending()))
+            self.assertEqual("down", inbox.ready()["watcher"]["state"])
+            self.assertIn("watcher", inbox.status())
+
+    def test_stall_episode_alerts_once_then_recovers(self):
+        now = 1_800_000_700.0
+        inbox = self.Inbox([{"at": "2027-01-15T08:00:00Z"}])
+        check = fm.MainStallCheck(inbox, 600, clock=lambda: now)
+        change, alert = check.poll()
+        self.assertEqual(1, change)
+        self.assertTrue(alert.startswith("메인 응답 없음"))
+        self.assertEqual((0, None), check.poll())
+        inbox._pending = []
+        change, recovery = check.poll()
+        self.assertEqual(-1, change)
+        self.assertTrue(recovery.startswith("메인 응답 복구됨"))
+
+    def test_watcher_down_is_a_stall_without_pending_note(self):
+        check = fm.MainStallCheck(self.Inbox(status="warning: watcher still down"), 600,
+                                  clock=lambda: 0)
+        change, alert = check.poll()
+        self.assertEqual(1, change)
+        self.assertIn("watcher", alert)
+
+    def test_probe_classifies_success_auth_failure_and_timeout(self):
+        success = [sys.executable, "-c", "print('OK')"]
+        login_failure = [sys.executable, "-c", "import sys; sys.stderr.write('login required'); sys.exit(1)"]
+        hanging = [sys.executable, "-c", "import time; time.sleep(2)"]
+        auth_status = [sys.executable, "-c", "print('{\\\"loggedIn\\\": false}')"]
+        self.assertEqual("ok", fm.run_claude_probe(success, 1, success).state)
+        self.assertEqual("auth", fm.run_claude_probe(login_failure, 1, success).state)
+        self.assertEqual("auth", fm.run_claude_probe([sys.executable, "-c", "import sys; sys.exit(1)"],
+                                                       1, auth_status).state)
+        self.assertEqual("hang", fm.run_claude_probe(hanging, 0.05, success).state)
 
 
 class FormattingTests(unittest.TestCase):

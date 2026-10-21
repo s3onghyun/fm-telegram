@@ -14,8 +14,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 from urllib.error import HTTPError, URLError
@@ -48,6 +50,13 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "transcript_prefixes": [],
     "fleet_alerts": False,
     "fleet_alert_labels": {},
+    "main_stall_alerts": False,
+    "main_stall_threshold_seconds": 600,
+    "claude_probe": False,
+    "claude_probe_interval_seconds": 3600,
+    "claude_probe_timeout_seconds": 90,
+    "claude_probe_command": ["claude", "-p", "reply OK", "--tools", ""],
+    "claude_auth_status_command": ["claude", "auth", "status"],
 }
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
@@ -473,6 +482,28 @@ class Inbox:
         except ValueError as exc:
             raise RuntimeError("fm-inbox returned invalid receipts JSON") from exc
 
+    def pending(self) -> list[dict[str, Any]]:
+        """Return pending notes through fm-inbox's public receipt interface."""
+        output = self._run(["receipts", "--all-pending"])
+        try:
+            result = json.loads(output)
+            pending = result.get("pending", [])
+        except (ValueError, AttributeError) as exc:
+            raise RuntimeError("fm-inbox returned invalid pending receipts JSON") from exc
+        if not isinstance(pending, list):
+            raise RuntimeError("fm-inbox returned invalid pending receipts JSON")
+        return [item for item in pending if isinstance(item, dict)]
+
+    def ready(self) -> dict[str, Any]:
+        output = self._run(["ready"])
+        try:
+            result = json.loads(output)
+        except ValueError as exc:
+            raise RuntimeError("fm-inbox returned invalid ready JSON") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("fm-inbox returned invalid ready JSON")
+        return result
+
 
 class State:
     def __init__(self, directory: Path) -> None:
@@ -497,6 +528,147 @@ class State:
             handle.write(json.dumps(self.data, separators=(",", ":")))
         os.chmod(temporary, 0o600)
         temporary.replace(self.path)
+
+
+class Episode:
+    """Remember one unhealthy period without repeating its alert every poll."""
+    def __init__(self, state: Optional[State] = None, key: Optional[str] = None) -> None:
+        self.state, self.key = state, key
+        self.active = bool(state.data.get(key, False)) if state and key else False
+
+    def update(self, unhealthy: bool) -> int:
+        if unhealthy == self.active:
+            return 0
+        self.active = unhealthy
+        if self.state and self.key:
+            self.state.data[self.key] = unhealthy
+            self.state.save()
+        return 1 if unhealthy else -1
+
+
+def _note_time(note: dict[str, Any]) -> Optional[float]:
+    value = note.get("at", note.get("created_at"))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _watcher_is_down(status: str, ready: dict[str, Any]) -> bool:
+    """Use the durable signals published by fm-inbox, never Firstmate state files."""
+    text = status.lower()
+    if "watcher still down" in text or re.search(r"\bwatcher\b[^\n]{0,80}\bdown\b", text):
+        return True
+    watcher = ready.get("watcher")
+    if isinstance(watcher, dict) and str(watcher.get("state", "")).lower() == "down":
+        return True
+    return str(ready.get("watcher_state", "")).lower() == "down"
+
+
+class MainStallCheck:
+    def __init__(self, inbox: Any, threshold: float, clock: Callable[[], float] = time.time,
+                 state: Optional[State] = None) -> None:
+        self.inbox, self.threshold, self.clock = inbox, threshold, clock
+        self.episode = Episode(state, "main_stall_active")
+
+    def poll(self) -> tuple[int, Optional[str]]:
+        pending = self.inbox.pending()
+        ready, status = self.inbox.ready(), self.inbox.status()
+        oldest = min((item for item in (_note_time(note) for note in pending) if item is not None),
+                     default=None)
+        age = self.clock() - oldest if oldest is not None else 0
+        waiting = oldest is not None and age >= self.threshold
+        watcher_down = _watcher_is_down(status, ready)
+        change = self.episode.update(waiting or watcher_down)
+        if not change:
+            return 0, None
+        if change < 0:
+            return change, "메인 응답 복구됨\n• 처리 대기 메모와 watcher 상태가 정상입니다."
+        details: list[str] = []
+        if waiting:
+            details.append("처리되지 않은 캡틴 메모가 %d분째 대기 중입니다." % max(1, age // 60))
+        if watcher_down:
+            details.append("Firstmate watcher가 꺼져 있습니다.")
+        hint = "Firstmate와 watcher를 확인해 주세요." if watcher_down else "Firstmate 메인을 확인해 주세요."
+        return change, "메인 응답 없음\n• " + "\n• ".join(details + [hint])
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    state: str
+
+
+AUTH_FAILURE = re.compile(r"\b(?:login|log in|auth(?:entication)?)\b", re.IGNORECASE)
+LOGGED_OUT = re.compile(r"logged[_ ]?in[^a-z]{0,20}false|not\s+logged\s+in", re.IGNORECASE)
+
+
+def classify_probe(returncode: int, output: str, timed_out: bool = False,
+                   auth_status: str = "") -> ProbeResult:
+    if timed_out:
+        return ProbeResult("hang")
+    if returncode == 0:
+        return ProbeResult("ok")
+    if AUTH_FAILURE.search(output) or LOGGED_OUT.search(auth_status):
+        return ProbeResult("auth")
+    return ProbeResult("error")
+
+
+def run_claude_probe(command: list[str], timeout: float,
+                     auth_command: list[str]) -> ProbeResult:
+    """Run a bounded no-tool probe and distinguish a timeout from an auth failure."""
+    try:
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return classify_probe(1, "", timed_out=True)
+    except OSError:
+        return ProbeResult("error")
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    auth_status = ""
+    if result.returncode:
+        try:
+            auth = subprocess.run(auth_command, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=min(timeout, 10), check=False)
+            auth_status = (auth.stdout or "") + "\n" + (auth.stderr or "")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return classify_probe(result.returncode, output, auth_status=auth_status)
+
+
+class ClaudeProbeCheck:
+    """Start probes off-loop, so a stuck CLI cannot pause Telegram polling."""
+    def __init__(self, command: list[str], auth_command: list[str], interval: float, timeout: float,
+                 clock: Callable[[], float] = time.monotonic, state: Optional[State] = None) -> None:
+        self.command, self.auth_command = command, auth_command
+        self.interval, self.timeout, self.clock = interval, timeout, clock
+        self.episode, self.next_at = Episode(state, "claude_probe_active"), 0.0
+        self._thread: Optional[threading.Thread] = None
+        self._result: Optional[ProbeResult] = None
+
+    def poll(self, send: Callable[[str], None]) -> None:
+        now = self.clock()
+        if self._thread and not self._thread.is_alive():
+            result, self._thread, self._result = self._result, None, None
+            self.next_at = now + self.interval
+            if result:
+                change = self.episode.update(result.state != "ok")
+                if change > 0:
+                    alerts = {"auth": "로그인 필요\n• Claude 로그인이 확인되지 않습니다.\n• `claude auth login`을 실행해 주세요.",
+                              "hang": "Claude 멈춤\n• Claude 점검이 제한 시간 안에 끝나지 않았습니다.\n• Claude를 다시 열고 로그인 상태를 확인해 주세요.",
+                              "error": "Claude 점검 실패\n• Claude probe가 실패했습니다.\n• `claude auth status`를 확인해 주세요."}
+                    send(alerts[result.state])
+                elif change < 0:
+                    send("Claude 점검 복구됨\n• Claude probe가 다시 정상 응답합니다.")
+        if self._thread is None and now >= self.next_at:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="fm-telegram-claude-probe")
+            self._thread.start()
+
+    def _run(self) -> None:
+        self._result = run_claude_probe(self.command, self.timeout, self.auth_command)
 
 
 @dataclass(frozen=True)
@@ -649,7 +821,9 @@ class Bridge:
                  doorbell: Optional[Doorbell] = None,
                  transcriber: Optional[Callable[[Path], str]] = None,
                  transcript_prefixes: Iterable[str] = (),
-                 fleet: Optional[FleetAlerts] = None) -> None:
+                 fleet: Optional[FleetAlerts] = None,
+                 main_stall: Optional[MainStallCheck] = None,
+                 claude_probe: Optional[ClaudeProbeCheck] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -658,6 +832,7 @@ class Bridge:
         self.transcriber = transcriber
         self.transcript_prefixes = list(transcript_prefixes)
         self.fleet = fleet
+        self.main_stall, self.claude_probe = main_stall, claude_probe
 
     def send(self, text: str) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
@@ -838,6 +1013,12 @@ class Bridge:
         self.check_replies()
         if self.fleet:
             self.fleet.poll(self.send)
+        if self.main_stall:
+            change, text = self.main_stall.poll()
+            if change and text:
+                self.send(text)
+        if self.claude_probe:
+            self.claude_probe.poll(self.send)
 
     def run(self, interval: float) -> None:
         delay = 1.0
@@ -869,6 +1050,18 @@ def _path(value: Any) -> Optional[Path]:
     return Path(str(value)).expanduser() if value else None
 
 
+def _command(value: Any, key: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise RuntimeError("config %s must be a non-empty command array" % key)
+    return list(value)
+
+
+def _positive_number(value: Any, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise RuntimeError("config %s must be a positive number" % key)
+    return float(value)
+
+
 def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     config = load_config(args.config, args.state_dir / "config.json")
     home = args.home or _path(config["firstmate_home"])
@@ -883,10 +1076,22 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     model, language = _path(config["whisper_model"]), str(config["whisper_language"])
     fleet = FleetAlerts(home / "state/fleet-ledger.jsonl", state,
                         config["fleet_alert_labels"]) if config["fleet_alerts"] else None
-    bridge = Bridge(TelegramAPI(token, base=config["api_base"]), Inbox(home), state,
+    inbox = Inbox(home)
+    main_stall = MainStallCheck(inbox, _positive_number(config["main_stall_threshold_seconds"],
+                                                         "main_stall_threshold_seconds"), state=state) \
+        if config["main_stall_alerts"] else None
+    claude_probe = ClaudeProbeCheck(
+        _command(config["claude_probe_command"], "claude_probe_command"),
+        _command(config["claude_auth_status_command"], "claude_auth_status_command"),
+        _positive_number(config["claude_probe_interval_seconds"], "claude_probe_interval_seconds"),
+        _positive_number(config["claude_probe_timeout_seconds"], "claude_probe_timeout_seconds"),
+        state=state,
+    ) if config["claude_probe"] else None
+    bridge = Bridge(TelegramAPI(token, base=config["api_base"]), inbox, state,
                     config["owner_chat_id"], redactor, logger, doorbell,
                     transcriber=lambda path: transcribe(path, whisper, model, language),
-                    transcript_prefixes=config["transcript_prefixes"], fleet=fleet)
+                    transcript_prefixes=config["transcript_prefixes"], fleet=fleet,
+                    main_stall=main_stall, claude_probe=claude_probe)
     return bridge, config
 
 
