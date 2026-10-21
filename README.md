@@ -104,7 +104,7 @@ From your phone, send the bot:
 - **Anything else** (stickers, locations, files over 20 MB) — never dropped silently: a note records what arrived, and the bot tells you it could not be saved.
 - `/status` — a short Firstmate inbox status. `/help` — usage.
 
-Firstmate answers with `fm-inbox.sh reply <note id> <text>`; the bridge picks the reply up from `fm-inbox.sh receipts` and sends it to you. Firstmate can also push a notification at any time:
+Firstmate answers with `fm-inbox.sh reply <note id> <text>`; the bridge picks the reply up from `fm-inbox.sh receipts` and sends it to you. When Firstmate drains one of your Telegram notes, the bridge reacts to that original Telegram message once with `👀` using Telegram's [setMessageReaction](https://core.telegram.org/bots/api#setmessagereaction); if Telegram rejects the reaction, it sends no extra message. Firstmate can also push a notification at any time:
 
 ```sh
 python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Deploy finished'

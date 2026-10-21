@@ -484,6 +484,13 @@ class TelegramAPI:
             "chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup,
         })
 
+    def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> Any:
+        """React to a message without creating another captain-facing message."""
+        return self.call("setMessageReaction", {
+            "chat_id": chat_id, "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+        })
+
 
 class Inbox:
     def __init__(self, home: Path) -> None:
@@ -525,8 +532,15 @@ class Inbox:
         # Status goes to Telegram, so local paths are shortened (README: no private paths).
         return self._run(["status"]).replace(str(self.home), "$FM_HOME").replace(str(Path.home()), "~")
 
-    def receipts(self, cursor: str) -> dict[str, Any]:
-        output = self._run(["receipts", "--after", cursor]) if cursor else self._run(["receipts"])
+    def receipts(self, cursor: str, all_handled: bool = False) -> dict[str, Any]:
+        args = ["receipts"]
+        if cursor:
+            args.extend(["--after", cursor])
+        if all_handled:
+            # Acknowledgements have no cursor: request the complete handled surface
+            # so an old Telegram note is not hidden behind fm-inbox's bounded view.
+            args.append("--all-handled")
+        output = self._run(args)
         try:
             return json.loads(output)
         except ValueError as exc:
@@ -1116,6 +1130,7 @@ class Bridge:
             known.append(note.id)
             if note.created and self.doorbell:
                 self.doorbell.queue(note.id)
+        self._remember_note_message(note.id, message)
 
         def select(current_choices: dict[str, Any]) -> Optional[dict[str, Any]]:
             current = current_choices.get(request_id)
@@ -1167,9 +1182,9 @@ class Bridge:
                 if isinstance(caption, str) and caption.strip():
                     note += "\n" + caption
                 self._submit(update_id, note, "Could not save that (%s). Only the fact that it "
-                             "arrived was sent as note %%s." % reason)
+                             "arrived was sent as note %%s." % reason, message)
                 return
-            self._submit(update_id, text)
+            self._submit(update_id, text, message=message)
             return
         command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
         if command == "/help":
@@ -1180,7 +1195,7 @@ class Bridge:
         if command == "/status":
             self.send(self.inbox.status()[:3500] or "No status available.")
             return
-        self._submit(update_id, text)
+        self._submit(update_id, text, message=message)
 
     def _attachment_text(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
         """Download a photo, voice/audio/video or any document; None means unsupported."""
@@ -1258,7 +1273,52 @@ class Bridge:
             parts.append("size=%sKB" % format(round(item["file_size"] / 1024), ","))
         return ", ".join(parts)
 
-    def _submit(self, update_id: int, text: str, receipt: str = "Received. Note ID: %s") -> None:
+    def _remember_note_message(self, note_id: str, message: dict[str, Any]) -> None:
+        """Persist the source message required to react after Firstmate drains its note."""
+        message_id = message.get("message_id")
+        if not isinstance(message_id, int):
+            return
+        messages = self.state.data.setdefault("telegram_note_messages", {})
+        if not isinstance(messages, dict):
+            messages = self.state.data["telegram_note_messages"] = {}
+        messages.setdefault(note_id, {"chat_id": self.owner_chat_id, "message_id": message_id})
+        self.state.save()
+
+    def _acknowledge_handled_notes(self, receipts: dict[str, Any]) -> None:
+        """React once to Telegram notes that fm-inbox reports as acknowledged.
+
+        The attempted ids are saved before the request.  This intentionally favors
+        no repeat notification after a restart over retrying a failed reaction.
+        """
+        messages = self.state.data.get("telegram_note_messages", {})
+        acknowledged = self.state.data.setdefault("telegram_acknowledged_note_ids", [])
+        if not isinstance(messages, dict) or not isinstance(acknowledged, list):
+            return
+        seen = set(acknowledged)
+        handled = receipts.get("handled", [])
+        if not isinstance(handled, list):
+            return
+        for receipt in handled:
+            note_id = receipt.get("id") if isinstance(receipt, dict) else None
+            if not isinstance(receipt, dict) or receipt.get("acknowledged") is not True:
+                continue
+            source = messages.get(note_id) if isinstance(note_id, str) else None
+            if note_id in seen or not isinstance(source, dict):
+                continue
+            chat_id, message_id = source.get("chat_id"), source.get("message_id")
+            if not isinstance(chat_id, int) or not isinstance(message_id, int):
+                continue
+            acknowledged.append(note_id)
+            seen.add(note_id)
+            self.state.save()
+            try:
+                self.api.set_reaction(chat_id, message_id, "👀")
+            except (TelegramAPIError, RuntimeError, OSError):
+                # A reaction is only a receipt signal; never add a fallback message.
+                self.log.warning("failed to react to acknowledged Telegram note id=%s", note_id)
+
+    def _submit(self, update_id: int, text: str, receipt: str = "Received. Note ID: %s",
+                message: Optional[dict[str, Any]] = None) -> None:
         note = self.inbox.note("tg:%d" % update_id, text)
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
@@ -1271,10 +1331,13 @@ class Bridge:
             known.append(note_id)
             if note.created and self.doorbell:
                 self.doorbell.queue(note_id)
+        if message is not None:
+            self._remember_note_message(note_id, message)
         self.send(receipt % note_id)
 
     def check_replies(self) -> None:
-        receipts = self.inbox.receipts(str(self.state.data.get("receipt_cursor", "")))
+        receipts = self.inbox.receipts(str(self.state.data.get("receipt_cursor", "")), all_handled=True)
+        self._acknowledge_handled_notes(receipts)
         known = set(self.state.data.get("telegram_note_ids", []))
         cursor = str(self.state.data.get("receipt_cursor", ""))
         for reply in receipts.get("replies", []):
