@@ -2,6 +2,8 @@
 
 A private Telegram bot bridge for [Firstmate](https://github.com/kunchenguid/firstmate). Message your bot from your phone and each message becomes a durable Firstmate inbox note; when Firstmate replies to that note, the reply comes back to the same Telegram chat.
 
+An out-of-tree bridge built only on `fm-inbox.sh` note, receipts and ready, it complements Firstmate's [pluggable out-of-band notifier proposal](https://github.com/kunchenguid/firstmate/issues/106) and [in-tree Telegram bridge](https://github.com/kunchenguid/firstmate/pull/4364).
+
 - One Python file, standard library only (Python 3.8+).
 - Long polling (`getUpdates`) only: no webhook, no open port, no public endpoint.
 - Exactly one allowed chat. Everything from any other chat is ignored before it is parsed.

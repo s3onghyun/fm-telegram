@@ -462,12 +462,12 @@ class HealthCheckTests(unittest.TestCase):
             script.parent.mkdir()
             script.write_text("#!/bin/sh\ncase \"$1 $2\" in\n"
                               "'receipts --all-pending') echo '{\"pending\":[{\"at\":\"2026-01-01T00:00:00Z\"}]}' ;;\n"
-                              "'ready ') echo '{\"watcher\":{\"state\":\"down\"}}' ;;\n"
+                              "'ready ') echo '{\"schema\":\"fm-primary-ready.v1\",\"home\":\"workspace/firstmate\",\"observed_at\":\"2026-01-01T00:00:00Z\",\"lock\":{\"state\":\"held\",\"pid\":1,\"live_harness\":true},\"wake_consumer\":{\"state\":\"down\",\"reason\":\"no-beacon\",\"beacon_age_seconds\":null},\"posture\":{\"state\":\"present\"},\"can_receive\":false}' ;;\n"
                               "'status ') echo 'watcher still down' ;;\nesac\n")
             script.chmod(0o700)
             inbox = fm.Inbox(root)
             self.assertEqual(1, len(inbox.pending()))
-            self.assertEqual("down", inbox.ready()["watcher"]["state"])
+            self.assertEqual("down", inbox.ready()["wake_consumer"]["state"])
             self.assertIn("watcher", inbox.status())
 
     def test_stall_episode_alerts_once_then_recovers(self):
@@ -486,6 +486,20 @@ class HealthCheckTests(unittest.TestCase):
     def test_watcher_down_is_a_stall_without_pending_note(self):
         check = fm.MainStallCheck(self.Inbox(status="warning: watcher still down"), 600,
                                   clock=lambda: 0)
+        change, alert = check.poll()
+        self.assertEqual(1, change)
+        self.assertIn("watcher", alert)
+
+    def test_ready_wake_consumer_down_is_a_stall_without_pending_note(self):
+        ready = {"wake_consumer": {"state": "down"}, "can_receive": False}
+        check = fm.MainStallCheck(self.Inbox(ready=ready), 600, clock=lambda: 0)
+        change, alert = check.poll()
+        self.assertEqual(1, change)
+        self.assertIn("watcher", alert)
+
+    def test_ready_not_receivable_is_a_stall_without_pending_note(self):
+        ready = {"wake_consumer": {"state": "healthy"}, "can_receive": False}
+        check = fm.MainStallCheck(self.Inbox(ready=ready), 600, clock=lambda: 0)
         change, alert = check.poll()
         self.assertEqual(1, change)
         self.assertIn("watcher", alert)
