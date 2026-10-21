@@ -23,6 +23,7 @@ class FakeTelegram:
         self.callback_answers = []
         self.markup_edits = []
         self.reply_markups = []
+        self.reactions = []
 
     def get_file(self, file_id, limit):
         self.file_requests.append(file_id)
@@ -47,6 +48,9 @@ class FakeTelegram:
     def edit_reply_markup(self, chat_id, message_id, reply_markup):
         self.markup_edits.append((chat_id, message_id, reply_markup))
 
+    def set_reaction(self, chat_id, message_id, emoji):
+        self.reactions.append((chat_id, message_id, emoji))
+
 
 class FakeInbox:
     def __init__(self, replies=None):
@@ -60,9 +64,10 @@ class FakeInbox:
     def status(self):
         return "healthy"
 
-    def receipts(self, cursor):
+    def receipts(self, cursor, all_handled=False):
         rows = [row for row in self.reply_rows if row["cursor"] > cursor]
-        return {"replies": rows, "reply_cursor": rows[-1]["cursor"] if rows else cursor}
+        return {"replies": rows, "handled": [],
+                "reply_cursor": rows[-1]["cursor"] if rows else cursor}
 
 
 class FakeHerdr:
@@ -90,7 +95,8 @@ class Clock:
 
 
 def update(number, chat_id, text):
-    return {"update_id": number, "message": {"chat": {"id": chat_id}, "text": text}}
+    return {"update_id": number, "message": {"message_id": number,
+                                                 "chat": {"id": chat_id}, "text": text}}
 
 
 def callback_update(number, chat_id, callback_id, data, message_id=1):
@@ -330,6 +336,16 @@ class BridgeTests(unittest.TestCase):
             api.get_file("fid", 5)
         self.assertNotIn(token, str(caught.exception))
 
+    def test_api_reaction_uses_set_message_reaction(self):
+        calls = []
+        def opener(request, timeout):
+            calls.append((request.full_url, json.loads(request.data)))
+            return FakeResponse(b'{"ok":true,"result":true}')
+        fm.TelegramAPI("123:secret", opener).set_reaction(OWNER, 77, "👀")
+        self.assertTrue(calls[0][0].endswith("/setMessageReaction"))
+        self.assertEqual({"chat_id": OWNER, "message_id": 77,
+                          "reaction": [{"type": "emoji", "emoji": "👀"}]}, calls[0][1])
+
     def test_request_id_is_update_id_and_replay_is_safe(self):
         item = update(44, OWNER, "same task")
         self.bridge.process_update(item)
@@ -406,6 +422,28 @@ class BridgeTests(unittest.TestCase):
         self.bridge.check_replies()
         self.assertEqual([(OWNER, "complete")], self.api.sent)
         self.assertEqual("000000000002", self.state.data["receipt_cursor"])
+
+    def test_handled_telegram_note_reacts_once_and_survives_restart(self):
+        self.bridge.process_update(update(44, OWNER, "same task"))
+        self.inbox.receipts = lambda _cursor, all_handled=False: {
+            "handled": [{"id": "note-tg:44", "acknowledged": True}], "replies": []}
+        self.bridge.check_replies()
+        self.assertEqual([(OWNER, 44, "👀")], self.api.reactions)
+        self.assertEqual(["note-tg:44"], self.state.data["telegram_acknowledged_note_ids"])
+        restarted = fm.Bridge(self.api, self.inbox, fm.State(self.state.directory), OWNER,
+                              fm.Redactor(), self.bridge.log)
+        restarted.check_replies()
+        self.assertEqual([(OWNER, 44, "👀")], self.api.reactions)
+
+    def test_failed_acknowledgement_reaction_sends_no_message_or_retry(self):
+        self.bridge.process_update(update(45, OWNER, "same task"))
+        self.inbox.receipts = lambda _cursor, all_handled=False: {
+            "handled": [{"id": "note-tg:45", "acknowledged": True}], "replies": []}
+        self.api.set_reaction = lambda *_args: (_ for _ in ()).throw(fm.TelegramAPIError("nope"))
+        self.bridge.check_replies()
+        self.bridge.check_replies()
+        self.assertEqual([(OWNER, "Received. Note ID: note-tg:45")], self.api.sent)
+        self.assertEqual(["note-tg:45"], self.state.data["telegram_acknowledged_note_ids"])
 
     def test_splitting_and_redaction(self):
         self.bridge.send("ghp_abcdefghijklmnop " + "x" * 5000)
