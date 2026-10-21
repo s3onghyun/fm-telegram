@@ -20,6 +20,9 @@ class FakeTelegram:
         self.offsets = []
         self.files = {}
         self.file_requests = []
+        self.callback_answers = []
+        self.markup_edits = []
+        self.reply_markups = []
 
     def get_file(self, file_id, limit):
         self.file_requests.append(file_id)
@@ -32,9 +35,17 @@ class FakeTelegram:
         self.offsets.append(offset)
         return list(self.pending_updates)
 
-    def send(self, chat_id, text, parse_mode=None):
+    def send(self, chat_id, text, parse_mode=None, reply_markup=None):
         self.sent.append((chat_id, text))
         self.parse_modes.append(parse_mode)
+        self.reply_markups.append(reply_markup)
+        return {"message_id": len(self.sent), "reply_markup": reply_markup}
+
+    def answer_callback(self, callback_id, text=None):
+        self.callback_answers.append((callback_id, text))
+
+    def edit_reply_markup(self, chat_id, message_id, reply_markup):
+        self.markup_edits.append((chat_id, message_id, reply_markup))
 
 
 class FakeInbox:
@@ -80,6 +91,13 @@ class Clock:
 
 def update(number, chat_id, text):
     return {"update_id": number, "message": {"chat": {"id": chat_id}, "text": text}}
+
+
+def callback_update(number, chat_id, callback_id, data, message_id=1):
+    return {"update_id": number, "callback_query": {
+        "id": callback_id, "data": data,
+        "message": {"message_id": message_id, "chat": {"id": chat_id}},
+    }}
 
 
 def media_update(number, chat_id, caption=None, **fields):
@@ -219,6 +237,51 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([], self.api.file_requests)
         self.assertEqual([], self.inbox.requests)
         self.assertEqual([], self.api.sent)
+
+    def test_choice_rendering_and_callback_create_one_note(self):
+        choices = fm.parse_choices(["1:a=Open now", "1:b=Later", "2:y=Yes", "2:n=Hold"])
+        self.bridge.send_choices("1) Open the deployment?\n2) Proceed?", choices)
+        request_id, pending = next(iter(self.state.data["pending_choices"].items()))
+        self.assertEqual([[{"text": "Open now", "callback_data": "fmchoice:%s:1:a" % request_id},
+                           {"text": "Later", "callback_data": "fmchoice:%s:1:b" % request_id}],
+                          [{"text": "Yes", "callback_data": "fmchoice:%s:2:y" % request_id},
+                           {"text": "Hold", "callback_data": "fmchoice:%s:2:n" % request_id}]],
+                         self.api.reply_markups[0]["inline_keyboard"])
+        callback = "fmchoice:%s:1:b" % request_id
+        self.bridge.process_update(callback_update(100, OWNER, "callback-100", callback))
+        self.assertEqual([("tg:callback:callback-100",
+                          "Decision reply to %s: 1b\nQuestion: Open the deployment?\nSelected: Later" % request_id)],
+                         self.inbox.requests)
+        self.assertEqual([("callback-100", None)], self.api.callback_answers)
+        self.assertEqual("b", pending["selected"]["1"])
+        self.assertEqual([[{"text": "✓ Later", "callback_data": callback}]],
+                         self.api.markup_edits[-1][2]["inline_keyboard"][:1])
+
+    def test_choice_callback_is_owner_only_and_idempotent(self):
+        self.bridge.send_choices("1) Deploy?", fm.parse_choices(["1:y=Yes", "1:n=No"]))
+        request_id = next(iter(self.state.data["pending_choices"]))
+        callback = "fmchoice:%s:1:y" % request_id
+        self.bridge.process_update(callback_update(101, 123, "outsider", callback))
+        self.assertEqual([], self.api.callback_answers)
+        self.assertEqual([], self.inbox.requests)
+        self.bridge.process_update(callback_update(102, OWNER, "wrong-message", callback, message_id=2))
+        self.assertEqual([], self.inbox.requests)
+        self.bridge.process_update(callback_update(102, OWNER, "same-callback", callback))
+        self.bridge.process_update(callback_update(102, OWNER, "same-callback", callback))
+        self.assertEqual(1, len(self.inbox.requests))
+        self.assertEqual("tg:callback:same-callback", self.inbox.requests[0][0])
+
+    def test_choice_expiry_and_parser_validation(self):
+        with self.assertRaisesRegex(ValueError, "QUESTION:OPTION"):
+            fm.parse_choices(["bad choice"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            fm.parse_choices(["1:a=Yes", "1:a=Again"])
+        with self.assertRaisesRegex(ValueError, "62"):
+            fm.parse_choices(["1:a=" + "x" * 63])
+        self.state.data["pending_choices"] = {"old": {"created_at": 0}}
+        with patch.object(fm.time, "time", return_value=fm.CHOICE_TTL_SECONDS + 1):
+            self.bridge.once()
+        self.assertEqual({}, self.state.data["pending_choices"])
 
     def test_api_get_file_uses_file_endpoint_and_caps_size(self):
         token, urls = "123:secret", []

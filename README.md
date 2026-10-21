@@ -111,6 +111,33 @@ python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Deploy finished'
 echo 'longer text' | python3 ~/.local/share/fm-telegram/fm_telegram.py notify -
 ```
 
+### Decision buttons
+
+For a notification that needs a structured answer, add one `--choice QUESTION:OPTION=LABEL`
+per button. Choices with the same question identifier are one Telegram row; use the same
+identifier at the start of the matching prompt line so the reply note can include that question.
+
+```sh
+printf '1) Open the deployment now?\n2) Run the migration?\n' | \
+python3 ~/.local/share/fm-telegram/fm_telegram.py notify - \
+  --choice '1:a=Open now' --choice '1:b=Later' \
+  --choice '2:y=Yes' --choice '2:n=Hold'
+```
+
+This sends one [inline keyboard](https://core.telegram.org/bots/api#inlinekeyboardmarkup).
+Each permitted press arrives as a Telegram
+[callback query](https://core.telegram.org/bots/api#callbackquery); the bridge accepts it only
+when the callback message is in `owner_chat_id`, calls
+[answerCallbackQuery](https://core.telegram.org/bots/api#answercallbackquery), and replaces that
+question's row with its checked selection through
+[editMessageReplyMarkup](https://core.telegram.org/bots/api#editmessagereplymarkup). It creates
+one inbox note immediately per selected question, such as `Decision reply to Ab3dEf: 1b`, followed
+by the question and label. A selected row is locked, so there is no extra **send** button.
+
+Pending choices are private bridge state and expire after seven days. A replayed callback uses its
+Telegram callback id as the stable inbox request id, so retries do not create a second note.
+Plain `notify` calls are unchanged.
+
 Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries, and if Telegram rejects the formatting the same part is resent as plain text. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
 
 ## Configuration
@@ -156,7 +183,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 |------|------|----------|
 | `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt) and, with `fleet_alerts`, the fleet ledger offset. |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), pending inline-choice state (for up to seven days), and, with `fleet_alerts`, the fleet ledger offset. |
 | `…/sent-prs.txt` | 0600 | With `fleet_alerts`: PR URLs already sent to you, one per line. Never pruned. |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
