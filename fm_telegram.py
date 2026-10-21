@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import fcntl
 import html
 import json
 import logging
@@ -559,23 +561,93 @@ class State:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
         self.path = directory / "state.json"
-        self.data: dict[str, Any] = self._load(self.path, {"offset": 0, "receipt_cursor": "", "telegram_note_ids": []})
+        self.lock_path = directory / "state.lock"
+        self.choices_path = directory / "pending-choices.json"
+        self.choices_lock_path = directory / "pending-choices.lock"
+        self.data: dict[str, Any] = self._load(
+            self.path, {"offset": 0, "receipt_cursor": "", "telegram_note_ids": []})
+        # v1 stored choices beside the polling state.  Move them to a file which
+        # notify can update without a long-running bridge overwriting it later.
+        legacy_choices = self.data.pop("pending_choices", None)
+        self._saved_data = copy.deepcopy(self.data)
+        if isinstance(legacy_choices, dict):
+            if not self.choices_path.exists():
+                self.update_choices(lambda choices: choices.update(legacy_choices))
+            # Arrange for the next ordinary state save to remove the old copy.
+            self._saved_data["pending_choices"] = legacy_choices
 
     @staticmethod
     def _load(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else dict(fallback)
         except (FileNotFoundError, ValueError):
             return dict(fallback)
 
+    @staticmethod
+    def _write(path: Path, data: dict[str, Any]) -> None:
+        # A unique temporary name matters because notify and run are separate
+        # processes.  os.replace makes every completed write all-or-nothing.
+        descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _changed_keys(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
+        return {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+
+    def _locked(self, path: Path) -> Any:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        handle = os.fdopen(descriptor, "r+")
+
+        class Lock:
+            def __enter__(_self: Any) -> None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+            def __exit__(_self: Any, *_args: Any) -> None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+
+        return Lock()
+
     def save(self) -> None:
-        temporary = self.path.with_suffix(".tmp")
-        # Create 0600 up front so the file is never briefly readable under a loose umask.
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(self.data, separators=(",", ":")))
-        os.chmod(temporary, 0o600)
-        temporary.replace(self.path)
+        # Do not write a stale in-memory snapshot over another process's keys.
+        # This is especially important because notify and run both use State.
+        changed = self._changed_keys(self._saved_data, self.data)
+        with self._locked(self.lock_path):
+            current = self._load(self.path, {})
+            for key in changed:
+                if key in self.data:
+                    current[key] = copy.deepcopy(self.data[key])
+                else:
+                    current.pop(key, None)
+            self._write(self.path, current)
+        self.data = current
+        self._saved_data = copy.deepcopy(current)
+
+    def choices(self) -> dict[str, Any]:
+        """Read choices fresh: a notify process may have just created one."""
+        with self._locked(self.choices_lock_path):
+            return self._load(self.choices_path, {})
+
+    def update_choices(self, change: Callable[[dict[str, Any]], Any]) -> Any:
+        """Atomically apply a change to the private pending-choice store."""
+        with self._locked(self.choices_lock_path):
+            choices = self._load(self.choices_path, {})
+            result = change(choices)
+            self._write(self.choices_path, choices)
+            return result
 
 
 class Episode:
@@ -906,16 +978,16 @@ class Bridge:
             self._last_send = time.monotonic()
 
     def _expire_choices(self) -> bool:
-        pending = self.state.data.get("pending_choices")
-        if not isinstance(pending, dict):
-            self.state.data["pending_choices"] = {}
-            return bool(pending)
         cutoff = time.time() - CHOICE_TTL_SECONDS
-        expired = [key for key, value in pending.items()
-                   if not isinstance(value, dict) or value.get("created_at", 0) < cutoff]
-        for key in expired:
-            del pending[key]
-        return bool(expired)
+
+        def expire(pending: dict[str, Any]) -> bool:
+            expired = [key for key, value in pending.items()
+                       if not isinstance(value, dict) or value.get("created_at", 0) < cutoff]
+            for key in expired:
+                del pending[key]
+            return bool(expired)
+
+        return bool(self.state.update_choices(expire))
 
     @staticmethod
     def _choice_markup(pending: dict[str, Any]) -> dict[str, Any]:
@@ -928,7 +1000,7 @@ class Bridge:
             if selected_id:
                 options = [option for option in options if option["id"] == selected_id]
             rows.append([{
-                "text": ("✓ " if option["id"] == selected_id else "") + option["label"],
+                "text": ("✅ " if option["id"] == selected_id else "") + option["label"],
                 "callback_data": "fmchoice:%s:%s:%s" %
                                  (pending["id"], question_id, option["id"]),
             } for option in options])
@@ -936,8 +1008,7 @@ class Bridge:
 
     def send_choices(self, text: str, choices: list[dict[str, Any]]) -> None:
         """Send one inline-keyboard notification and persist its reply state first."""
-        if self._expire_choices():
-            self.state.save()
+        self._expire_choices()
         redacted_text = self.redactor.redact(text)
         questions: list[dict[str, Any]] = []
         for choice in choices:
@@ -951,14 +1022,16 @@ class Bridge:
         formatted = markdown_to_telegram_html(redacted_text)
         if len(formatted) > TELEGRAM_LIMIT:
             raise ValueError("choice notification is too long for one Telegram message")
-        pending = self.state.data.setdefault("pending_choices", {})
-        request_id = secrets.token_urlsafe(6)
-        while request_id in pending:
+        def create(pending: dict[str, Any]) -> dict[str, Any]:
             request_id = secrets.token_urlsafe(6)
-        request = {"id": request_id, "created_at": time.time(), "text": redacted_text,
-                   "questions": questions, "selected": {}}
-        pending[request_id] = request
-        self.state.save()
+            while request_id in pending:
+                request_id = secrets.token_urlsafe(6)
+            request = {"id": request_id, "created_at": time.time(), "text": redacted_text,
+                       "questions": questions, "selected": {}}
+            pending[request_id] = request
+            return request
+
+        request = self.state.update_choices(create)
         try:
             result = self.api.send(self.owner_chat_id, formatted, parse_mode="HTML",
                                    reply_markup=self._choice_markup(request))
@@ -968,8 +1041,13 @@ class Bridge:
         message_id = result.get("message_id") if isinstance(result, dict) else None
         if not isinstance(message_id, int):
             raise RuntimeError("Telegram sendMessage returned no message id for choices")
-        request["message_id"] = message_id
-        self.state.save()
+
+        def remember_message(pending: dict[str, Any]) -> None:
+            current = pending.get(request["id"])
+            if isinstance(current, dict):
+                current["message_id"] = message_id
+
+        self.state.update_choices(remember_message)
 
     def _handle_callback(self, callback: Any) -> None:
         if not isinstance(callback, dict):
@@ -982,49 +1060,83 @@ class Bridge:
             return
         callback_id = callback.get("id")
         if not isinstance(callback_id, str):
+            self.log.warning("ignored Telegram callback without an id")
             return
-        self.api.answer_callback(callback_id)
-        if self._expire_choices():
-            self.state.save()
+        self._expire_choices()
         data = callback.get("data")
         parts = data.split(":") if isinstance(data, str) else []
         if len(parts) != 4 or parts[0] != "fmchoice":
+            self.log.warning("unknown Telegram callback format")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         request_id, question_id, option_id = parts[1:]
-        pending = self.state.data.get("pending_choices", {}).get(request_id)
+        pending = self.state.choices().get(request_id)
         if not isinstance(pending, dict):
+            self.log.warning("unknown Telegram choice callback")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         if message.get("message_id") != pending.get("message_id"):
+            self.log.warning("unknown Telegram choice callback message")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         question = next((item for item in pending.get("questions", [])
                          if item.get("id") == question_id), None)
         if not isinstance(question, dict):
+            self.log.warning("unknown Telegram choice question")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         option = next((item for item in question.get("options", [])
                        if item.get("id") == option_id), None)
         if not isinstance(option, dict):
+            self.log.warning("unknown Telegram choice option")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
-        selected = pending.setdefault("selected", {})
-        if selected.get(question_id) != option_id:
-            if question_id not in selected:
-                if not NOTE_ID.fullmatch(callback_id):
-                    return
-                body = "Decision reply to %s: %s%s\nQuestion: %s\nSelected: %s" % (
-                    request_id, question_id, option_id, question["text"], option["label"])
-                note = self.inbox.note("tg:callback:" + callback_id, body)
-                if isinstance(note, str):
-                    note = Note(note)
-                known = self.state.data.setdefault("telegram_note_ids", [])
-                if note.id not in known:
-                    known.append(note.id)
-                    if note.created and self.doorbell:
-                        self.doorbell.queue(note.id)
-                selected[question_id] = option_id
-                self.state.save()
-        message_id = pending.get("message_id")
+        selected = pending.get("selected", {})
+        if not isinstance(selected, dict):
+            selected = {}
+        if question_id in selected:
+            self.api.answer_callback(callback_id, "이미 받았어요")
+            return
+        if not NOTE_ID.fullmatch(callback_id):
+            self.log.warning("ignored Telegram callback with unsafe id")
+            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            return
+        body = "Decision reply to %s: %s%s\nQuestion: %s\nSelected: %s" % (
+            request_id, question_id, option_id, question["text"], option["label"])
+        try:
+            note = self.inbox.note("tg:callback:" + callback_id, body)
+        except (OSError, RuntimeError):
+            self.log.warning("failed to record Telegram choice callback")
+            self.api.answer_callback(callback_id, "처리하지 못했어요, 다시 눌러 주세요")
+            raise
+        if isinstance(note, str):
+            note = Note(note)
+        known = self.state.data.setdefault("telegram_note_ids", [])
+        if note.id not in known:
+            known.append(note.id)
+            if note.created and self.doorbell:
+                self.doorbell.queue(note.id)
+
+        def select(current_choices: dict[str, Any]) -> Optional[dict[str, Any]]:
+            current = current_choices.get(request_id)
+            if not isinstance(current, dict):
+                return None
+            current_selected = current.setdefault("selected", {})
+            if not isinstance(current_selected, dict) or question_id in current_selected:
+                return None
+            current_selected[question_id] = option_id
+            return current
+
+        chosen = self.state.update_choices(select)
+        if not isinstance(chosen, dict):
+            self.api.answer_callback(callback_id, "이미 받았어요")
+            return
+        self.state.save()
+        self.api.answer_callback(callback_id, "받았어요 ✓ %s%s" % (question_id, option_id))
+        message_id = chosen.get("message_id")
         if isinstance(message_id, int):
             self.api.edit_reply_markup(self.owner_chat_id, message_id,
-                                       self._choice_markup(pending))
+                                       self._choice_markup(chosen))
 
     def process_update(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -1178,8 +1290,7 @@ class Bridge:
             self.state.save()
 
     def once(self) -> None:
-        if self._expire_choices():
-            self.state.save()
+        self._expire_choices()
         offset = int(self.state.data.get("offset", 0))
         for update in self.api.updates(offset):
             self.process_update(update)

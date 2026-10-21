@@ -241,7 +241,7 @@ class BridgeTests(unittest.TestCase):
     def test_choice_rendering_and_callback_create_one_note(self):
         choices = fm.parse_choices(["1:a=Open now", "1:b=Later", "2:y=Yes", "2:n=Hold"])
         self.bridge.send_choices("1) Open the deployment?\n2) Proceed?", choices)
-        request_id, pending = next(iter(self.state.data["pending_choices"].items()))
+        request_id, pending = next(iter(self.state.choices().items()))
         self.assertEqual([[{"text": "Open now", "callback_data": "fmchoice:%s:1:a" % request_id},
                            {"text": "Later", "callback_data": "fmchoice:%s:1:b" % request_id}],
                           [{"text": "Yes", "callback_data": "fmchoice:%s:2:y" % request_id},
@@ -252,14 +252,14 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([("tg:callback:callback-100",
                           "Decision reply to %s: 1b\nQuestion: Open the deployment?\nSelected: Later" % request_id)],
                          self.inbox.requests)
-        self.assertEqual([("callback-100", None)], self.api.callback_answers)
-        self.assertEqual("b", pending["selected"]["1"])
-        self.assertEqual([[{"text": "✓ Later", "callback_data": callback}]],
+        self.assertEqual([("callback-100", "받았어요 ✓ 1b")], self.api.callback_answers)
+        self.assertEqual("b", self.state.choices()[request_id]["selected"]["1"])
+        self.assertEqual([[{"text": "✅ Later", "callback_data": callback}]],
                          self.api.markup_edits[-1][2]["inline_keyboard"][:1])
 
     def test_choice_callback_is_owner_only_and_idempotent(self):
         self.bridge.send_choices("1) Deploy?", fm.parse_choices(["1:y=Yes", "1:n=No"]))
-        request_id = next(iter(self.state.data["pending_choices"]))
+        request_id = next(iter(self.state.choices()))
         callback = "fmchoice:%s:1:y" % request_id
         self.bridge.process_update(callback_update(101, 123, "outsider", callback))
         self.assertEqual([], self.api.callback_answers)
@@ -270,6 +270,8 @@ class BridgeTests(unittest.TestCase):
         self.bridge.process_update(callback_update(102, OWNER, "same-callback", callback))
         self.assertEqual(1, len(self.inbox.requests))
         self.assertEqual("tg:callback:same-callback", self.inbox.requests[0][0])
+        self.assertEqual([("same-callback", "받았어요 ✓ 1y"),
+                          ("same-callback", "이미 받았어요")], self.api.callback_answers[-2:])
 
     def test_choice_expiry_and_parser_validation(self):
         with self.assertRaisesRegex(ValueError, "QUESTION:OPTION"):
@@ -278,10 +280,41 @@ class BridgeTests(unittest.TestCase):
             fm.parse_choices(["1:a=Yes", "1:a=Again"])
         with self.assertRaisesRegex(ValueError, "62"):
             fm.parse_choices(["1:a=" + "x" * 63])
-        self.state.data["pending_choices"] = {"old": {"created_at": 0}}
+        self.state.update_choices(lambda pending: pending.update({"old": {"created_at": 0}}))
         with patch.object(fm.time, "time", return_value=fm.CHOICE_TTL_SECONDS + 1):
             self.bridge.once()
-        self.assertEqual({}, self.state.data["pending_choices"])
+        self.assertEqual({}, self.state.choices())
+
+    def test_choice_survives_stale_bridge_state_save_and_is_read_for_callback(self):
+        # The long-running bridge has this State before notify starts.
+        running_state = self.state
+        notify_state = fm.State(running_state.directory)
+        notify_state.data["receipt_cursor"] = "from-notify"
+        notify_state.save()
+        notifier = fm.Bridge(FakeTelegram(), FakeInbox(), notify_state, OWNER, fm.Redactor(),
+                             logging.getLogger("choice-notifier-%s" % id(self)))
+        notifier.send_choices("1) Deploy?", fm.parse_choices(["1:b=Later"]))
+        request_id = next(iter(notify_state.choices()))
+
+        # A normal poll save must keep both keys notify wrote while recording its offset.
+        running_state.data["offset"] = 101
+        running_state.save()
+        fresh = fm.State(running_state.directory)
+        self.assertEqual(101, fresh.data["offset"])
+        self.assertEqual("from-notify", fresh.data["receipt_cursor"])
+        self.assertIn(request_id, fresh.choices())
+
+        # Callback handling reads the choice store afresh rather than the old State snapshot.
+        self.bridge.process_update(callback_update(101, OWNER, "callback-race",
+                                                   "fmchoice:%s:1:b" % request_id))
+        self.assertEqual("tg:callback:callback-race", self.inbox.requests[-1][0])
+        self.assertEqual(("callback-race", "받았어요 ✓ 1b"), self.api.callback_answers[-1])
+
+    def test_unknown_choice_callback_shows_expiry_toast_and_is_logged(self):
+        self.bridge.process_update(callback_update(100, OWNER, "gone", "fmchoice:gone:1:b"))
+        self.assertEqual([("gone", "만료된 선택이에요, 텍스트로 답해 주세요")],
+                         self.api.callback_answers)
+        self.assertIn("unknown Telegram choice callback", self.stream.getvalue())
 
     def test_api_get_file_uses_file_endpoint_and_caps_size(self):
         token, urls = "123:secret", []
