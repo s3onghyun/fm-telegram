@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -35,6 +36,7 @@ DEFAULT_STATE = _xdg("XDG_STATE_HOME", ".local/state") / "fm-telegram"
 DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share") / "fm-telegram"
 TOKEN_ENV = "FM_TELEGRAM_BOT_TOKEN"
 MAX_HANDLED_UPDATES = 1000
+CHOICE_TTL_SECONDS = 7 * 24 * 60 * 60
 CONFIG_DEFAULTS: dict[str, Any] = {
     "owner_chat_id": None,
     "firstmate_home": None,
@@ -63,6 +65,7 @@ MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful 
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Bot API getFile download limit.
 DOORBELL_COOLDOWN_SECONDS = 20.0
 NOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+CHOICE_SPEC = re.compile(r"([A-Za-z0-9_-]{1,16}):([A-Za-z0-9_-]{1,16})=(.+)")
 AFCONVERT = "/usr/bin/afconvert"  # Built into macOS; decodes Telegram OGG/Opus and MP4.
 VOICE_KINDS = {"voice": "audio/ogg", "audio": "audio/mpeg", "video": "video/mp4",
                "video_note": "video/mp4"}
@@ -354,6 +357,36 @@ def _check_api_base(url: str) -> str:
     return url.rstrip("/")
 
 
+def parse_choices(values: Iterable[str]) -> list[dict[str, Any]]:
+    """Parse repeated QUESTION:OPTION=label command-line choice specifications."""
+    questions: dict[str, dict[str, Any]] = {}
+    for value in values:
+        match = CHOICE_SPEC.fullmatch(value)
+        if not match:
+            raise ValueError("choice must be QUESTION:OPTION=label")
+        question_id, option_id, label = match.groups()
+        label = label.strip()
+        if not label or len(label) > 62:
+            raise ValueError("choice labels must be 1 to 62 characters")
+        question = questions.setdefault(question_id, {"id": question_id, "options": []})
+        if any(option["id"] == option_id for option in question["options"]):
+            raise ValueError("duplicate choice: %s:%s" % (question_id, option_id))
+        question["options"].append({"id": option_id, "label": label})
+    if not questions:
+        raise ValueError("at least one --choice is required")
+    return list(questions.values())
+
+
+def _choice_question(text: str, question_id: str) -> str:
+    """Keep the matching numbered prompt with a choice reply when practical."""
+    pattern = re.compile(r"^\s*%s[).:]\s*(.+)$" % re.escape(question_id))
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            return match.group(1).strip()
+    return "Question %s" % question_id
+
+
 def load_config(path: Path, legacy: Optional[Path] = None) -> dict[str, Any]:
     """Load the user-owned JSON config; it chooses which fm-inbox.sh runs, so refuse loose modes."""
     if not path.exists() and legacy and legacy.exists():
@@ -407,7 +440,7 @@ class TelegramAPI:
 
     def updates(self, offset: int) -> list[dict[str, Any]]:
         return self.call("getUpdates", {"offset": offset, "timeout": 30,
-                                        "allowed_updates": ["message"]})
+                                        "allowed_updates": ["message", "callback_query"]})
 
     def get_file(self, file_id: str, limit: int) -> tuple[str, bytes]:
         """Return Telegram's file_path and contents, refusing anything over limit bytes."""
@@ -427,12 +460,27 @@ class TelegramAPI:
             raise AttachmentTooLarge()
         return path, data
 
-    def send(self, chat_id: int, text: str, parse_mode: Optional[str] = None) -> None:
+    def send(self, chat_id: int, text: str, parse_mode: Optional[str] = None,
+             reply_markup: Optional[dict[str, Any]] = None) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text,
                                    "disable_web_page_preview": True}
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        self.call("sendMessage", payload)
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.call("sendMessage", payload)
+
+    def answer_callback(self, callback_id: str, text: Optional[str] = None) -> Any:
+        payload: dict[str, Any] = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        return self.call("answerCallbackQuery", payload)
+
+    def edit_reply_markup(self, chat_id: int, message_id: int,
+                          reply_markup: dict[str, Any]) -> Any:
+        return self.call("editMessageReplyMarkup", {
+            "chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup,
+        })
 
 
 class Inbox:
@@ -857,7 +905,131 @@ class Bridge:
                 self.api.send(self.owner_chat_id, _plain_html(part))
             self._last_send = time.monotonic()
 
+    def _expire_choices(self) -> bool:
+        pending = self.state.data.get("pending_choices")
+        if not isinstance(pending, dict):
+            self.state.data["pending_choices"] = {}
+            return bool(pending)
+        cutoff = time.time() - CHOICE_TTL_SECONDS
+        expired = [key for key, value in pending.items()
+                   if not isinstance(value, dict) or value.get("created_at", 0) < cutoff]
+        for key in expired:
+            del pending[key]
+        return bool(expired)
+
+    @staticmethod
+    def _choice_markup(pending: dict[str, Any]) -> dict[str, Any]:
+        rows: list[list[dict[str, str]]] = []
+        selected = pending.get("selected", {})
+        for question in pending.get("questions", []):
+            question_id = question["id"]
+            selected_id = selected.get(question_id)
+            options = question["options"]
+            if selected_id:
+                options = [option for option in options if option["id"] == selected_id]
+            rows.append([{
+                "text": ("✓ " if option["id"] == selected_id else "") + option["label"],
+                "callback_data": "fmchoice:%s:%s:%s" %
+                                 (pending["id"], question_id, option["id"]),
+            } for option in options])
+        return {"inline_keyboard": rows}
+
+    def send_choices(self, text: str, choices: list[dict[str, Any]]) -> None:
+        """Send one inline-keyboard notification and persist its reply state first."""
+        if self._expire_choices():
+            self.state.save()
+        redacted_text = self.redactor.redact(text)
+        questions: list[dict[str, Any]] = []
+        for choice in choices:
+            question_id = choice["id"]
+            questions.append({
+                "id": question_id,
+                "text": self.redactor.redact(_choice_question(text, question_id)),
+                "options": [{"id": option["id"], "label": self.redactor.redact(option["label"])}
+                            for option in choice["options"]],
+            })
+        formatted = markdown_to_telegram_html(redacted_text)
+        if len(formatted) > TELEGRAM_LIMIT:
+            raise ValueError("choice notification is too long for one Telegram message")
+        pending = self.state.data.setdefault("pending_choices", {})
+        request_id = secrets.token_urlsafe(6)
+        while request_id in pending:
+            request_id = secrets.token_urlsafe(6)
+        request = {"id": request_id, "created_at": time.time(), "text": redacted_text,
+                   "questions": questions, "selected": {}}
+        pending[request_id] = request
+        self.state.save()
+        try:
+            result = self.api.send(self.owner_chat_id, formatted, parse_mode="HTML",
+                                   reply_markup=self._choice_markup(request))
+        except TelegramAPIError:
+            result = self.api.send(self.owner_chat_id, _plain_html(formatted),
+                                   reply_markup=self._choice_markup(request))
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if not isinstance(message_id, int):
+            raise RuntimeError("Telegram sendMessage returned no message id for choices")
+        request["message_id"] = message_id
+        self.state.save()
+
+    def _handle_callback(self, callback: Any) -> None:
+        if not isinstance(callback, dict):
+            return
+        message = callback.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id != self.owner_chat_id:
+            if isinstance(chat_id, int):
+                self.log.warning("ignored Telegram callback from chat id=%d", chat_id)
+            return
+        callback_id = callback.get("id")
+        if not isinstance(callback_id, str):
+            return
+        self.api.answer_callback(callback_id)
+        if self._expire_choices():
+            self.state.save()
+        data = callback.get("data")
+        parts = data.split(":") if isinstance(data, str) else []
+        if len(parts) != 4 or parts[0] != "fmchoice":
+            return
+        request_id, question_id, option_id = parts[1:]
+        pending = self.state.data.get("pending_choices", {}).get(request_id)
+        if not isinstance(pending, dict):
+            return
+        if message.get("message_id") != pending.get("message_id"):
+            return
+        question = next((item for item in pending.get("questions", [])
+                         if item.get("id") == question_id), None)
+        if not isinstance(question, dict):
+            return
+        option = next((item for item in question.get("options", [])
+                       if item.get("id") == option_id), None)
+        if not isinstance(option, dict):
+            return
+        selected = pending.setdefault("selected", {})
+        if selected.get(question_id) != option_id:
+            if question_id not in selected:
+                if not NOTE_ID.fullmatch(callback_id):
+                    return
+                body = "Decision reply to %s: %s%s\nQuestion: %s\nSelected: %s" % (
+                    request_id, question_id, option_id, question["text"], option["label"])
+                note = self.inbox.note("tg:callback:" + callback_id, body)
+                if isinstance(note, str):
+                    note = Note(note)
+                known = self.state.data.setdefault("telegram_note_ids", [])
+                if note.id not in known:
+                    known.append(note.id)
+                    if note.created and self.doorbell:
+                        self.doorbell.queue(note.id)
+                selected[question_id] = option_id
+                self.state.save()
+        message_id = pending.get("message_id")
+        if isinstance(message_id, int):
+            self.api.edit_reply_markup(self.owner_chat_id, message_id,
+                                       self._choice_markup(pending))
+
     def process_update(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            self._handle_callback(update["callback_query"])
+            return
         update_id = update.get("update_id")
         if not isinstance(update_id, int):
             return
@@ -1006,6 +1178,8 @@ class Bridge:
             self.state.save()
 
     def once(self) -> None:
+        if self._expire_choices():
+            self.state.save()
         offset = int(self.state.data.get("offset", 0))
         for update in self.api.updates(offset):
             self.process_update(update)
@@ -1109,11 +1283,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("run")
     notify = sub.add_parser("notify", help="send a redacted captain-facing notification")
     notify.add_argument("text", help="notification text, or - to read stdin")
+    notify.add_argument("--choice", action="append", default=[], metavar="QUESTION:OPTION=LABEL",
+                        help="add an inline button; repeat for each option")
     args = parser.parse_args(argv)
     bridge, config = build_bridge(args)
     if args.command == "notify":
         text = sys.stdin.read() if args.text == "-" else args.text
-        bridge.send(text)
+        if args.choice:
+            bridge.send_choices(text, parse_choices(args.choice))
+        else:
+            bridge.send(text)
         if bridge.fleet:
             bridge.fleet.remember(text)
         return 0
