@@ -495,8 +495,11 @@ class HealthCheckTests(unittest.TestCase):
         login_failure = [sys.executable, "-c", "import sys; sys.stderr.write('login required'); sys.exit(1)"]
         hanging = [sys.executable, "-c", "import time; time.sleep(2)"]
         auth_status = [sys.executable, "-c", "print('{\\\"loggedIn\\\": false}')"]
+        auth_failure = [sys.executable, "-c", "import sys; sys.exit(1)"]
         self.assertEqual("ok", fm.run_claude_probe(success, 1, success).state)
         self.assertEqual("auth", fm.run_claude_probe(login_failure, 1, success).state)
+        self.assertEqual("auth", fm.run_claude_probe(auth_status, 1, success).state)
+        self.assertEqual("auth", fm.run_claude_probe(auth_failure, 1, auth_failure).state)
         self.assertEqual("auth", fm.run_claude_probe([sys.executable, "-c", "import sys; sys.exit(1)"],
                                                        1, auth_status).state)
         self.assertEqual("hang", fm.run_claude_probe(hanging, 0.05, success).state)

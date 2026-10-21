@@ -136,7 +136,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `claude_probe` | `false` | Run the bounded Claude login/response probe below. |
 | `claude_probe_interval_seconds` | `3600` | Time between completed Claude probes. |
 | `claude_probe_timeout_seconds` | `90` | Maximum time for one Claude probe before it is killed and reported as hung. |
-| `claude_probe_command` | `["claude", "-p", "reply OK", "--tools", ""]` | Command array for the no-tool probe. |
+| `claude_probe_command` | `["claude", "auth", "status"]` | Command array for the no-model probe. |
 | `claude_auth_status_command` | `["claude", "auth", "status"]` | Command array checked after a failed probe for a logged-out state. |
 | `oss_watch` | — | Settings for the optional GitHub watcher (below). |
 
@@ -217,9 +217,10 @@ With `main_stall_alerts`, the bridge calls `fm-inbox.sh receipts --all-pending`,
 It alerts once when the oldest pending captain note has exceeded the threshold or the public status reports that the watcher is down, then sends one recovery notice after both conditions clear.
 The episode state is kept in the bridge state file, so restarting the bridge does not repeat an active alert.
 
-With `claude_probe`, the bridge starts the configured `claude -p` command in a background thread at the configured interval.
-The command has no tools by default and is killed at its timeout, so it never pauses Telegram polling.
-A failed command that mentions login/authentication, or whose `claude auth status` output says `loggedIn: false`, sends `로그인 필요` with the `claude auth login` hint.
+With `claude_probe`, the bridge starts the configured `claude auth status` command in a background thread at the configured interval.
+The default avoids model calls and quota use; set `claude_probe_command` to a `claude -p` command only when an opt-in model-response check is needed.
+The command is killed at its timeout, so it never pauses Telegram polling.
+A default probe that exits non-zero or reports `loggedIn: false`, or a custom command that reports login/authentication failure, sends `로그인 필요` with the `claude auth login` hint.
 A timeout sends `Claude 멈춤`; every failure type sends one alert and one recovery notice when a later probe succeeds.
 
 ## Optional: GitHub activity watcher
