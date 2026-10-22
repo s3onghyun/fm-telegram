@@ -38,6 +38,9 @@ DEFAULT_STATE = _xdg("XDG_STATE_HOME", ".local/state") / "fm-telegram"
 DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share") / "fm-telegram"
 TOKEN_ENV = "FM_TELEGRAM_BOT_TOKEN"
 MAX_HANDLED_UPDATES = 1000
+SEEN_REACTION = "👀"
+# ✅ is not in Telegram's ReactionTypeEmoji allowed list; 👌 is the closest allowed check.
+DONE_REACTION = "👌"
 CHOICE_TTL_SECONDS = 7 * 24 * 60 * 60
 CONFIG_DEFAULTS: dict[str, Any] = {
     "owner_chat_id": None,
@@ -1284,38 +1287,40 @@ class Bridge:
         messages.setdefault(note_id, {"chat_id": self.owner_chat_id, "message_id": message_id})
         self.state.save()
 
-    def _acknowledge_handled_notes(self, receipts: dict[str, Any]) -> None:
-        """React once to Telegram notes that fm-inbox reports as acknowledged.
+    def _react_once(self, note_id: Any, state_key: str, emoji: str) -> None:
+        """Set one reaction on a Telegram note's source message, at most once per stage.
 
-        The attempted ids are saved before the request.  This intentionally favors
+        The attempted id is saved before the request.  This intentionally favors
         no repeat notification after a restart over retrying a failed reaction.
         """
         messages = self.state.data.get("telegram_note_messages", {})
-        acknowledged = self.state.data.setdefault("telegram_acknowledged_note_ids", [])
-        if not isinstance(messages, dict) or not isinstance(acknowledged, list):
+        attempted = self.state.data.setdefault(state_key, [])
+        if not isinstance(messages, dict) or not isinstance(attempted, list):
             return
-        seen = set(acknowledged)
+        source = messages.get(note_id) if isinstance(note_id, str) else None
+        if note_id in attempted or not isinstance(source, dict):
+            return
+        chat_id, message_id = source.get("chat_id"), source.get("message_id")
+        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+            return
+        attempted.append(note_id)
+        self.state.save()
+        try:
+            self.api.set_reaction(chat_id, message_id, emoji)
+        except (TelegramAPIError, RuntimeError, OSError):
+            # A reaction is only a receipt signal; never add a fallback message.
+            self.log.warning("failed to react to Telegram note id=%s", note_id)
+
+    def _acknowledge_handled_notes(self, receipts: dict[str, Any]) -> None:
+        """React 👀 once to Telegram notes that fm-inbox reports as acknowledged."""
         handled = receipts.get("handled", [])
         if not isinstance(handled, list):
             return
+        completed = self.state.data.get("telegram_completed_note_ids", [])
         for receipt in handled:
-            note_id = receipt.get("id") if isinstance(receipt, dict) else None
-            if not isinstance(receipt, dict) or receipt.get("acknowledged") is not True:
-                continue
-            source = messages.get(note_id) if isinstance(note_id, str) else None
-            if note_id in seen or not isinstance(source, dict):
-                continue
-            chat_id, message_id = source.get("chat_id"), source.get("message_id")
-            if not isinstance(chat_id, int) or not isinstance(message_id, int):
-                continue
-            acknowledged.append(note_id)
-            seen.add(note_id)
-            self.state.save()
-            try:
-                self.api.set_reaction(chat_id, message_id, "👀")
-            except (TelegramAPIError, RuntimeError, OSError):
-                # A reaction is only a receipt signal; never add a fallback message.
-                self.log.warning("failed to react to acknowledged Telegram note id=%s", note_id)
+            if isinstance(receipt, dict) and receipt.get("acknowledged") is True \
+                    and receipt.get("id") not in completed:  # Never downgrade 👌 back to 👀.
+                self._react_once(receipt.get("id"), "telegram_acknowledged_note_ids", SEEN_REACTION)
 
     def _submit(self, update_id: int, text: str, receipt: str = "Received. Note ID: %s",
                 message: Optional[dict[str, Any]] = None) -> None:
@@ -1344,6 +1349,8 @@ class Bridge:
             reply_cursor = str(reply.get("cursor", ""))
             if reply.get("id") in known:
                 self.send(str(reply.get("body", "")))
+                # A published reply completes the note; setMessageReaction replaces 👀.
+                self._react_once(reply.get("id"), "telegram_completed_note_ids", DONE_REACTION)
             # All receipts are consumed to avoid permanent re-polling of unrelated replies.
             cursor = reply_cursor or cursor
             self.state.data["receipt_cursor"] = cursor
