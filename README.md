@@ -104,7 +104,7 @@ From your phone, send the bot:
 - **Anything else** (stickers, locations, files over 20 MB) — never dropped silently: a note records what arrived, and the bot tells you it could not be saved.
 - `/status` — a short Firstmate inbox status. `/help` — usage.
 
-Firstmate answers with `fm-inbox.sh reply <note id> <text>`; the bridge picks the reply up from `fm-inbox.sh receipts` and sends it to you. When Firstmate drains one of your Telegram notes, the bridge reacts to that original Telegram message once with `👀` using Telegram's [setMessageReaction](https://core.telegram.org/bots/api#setmessagereaction); if Telegram rejects the reaction, it sends no extra message. Firstmate can also push a notification at any time:
+Firstmate answers with `fm-inbox.sh reply <note id> <text>`; the bridge picks the reply up from `fm-inbox.sh receipts` and sends it to you. The original Telegram message carries a status reaction, set with Telegram's [setMessageReaction](https://core.telegram.org/bots/api#setmessagereaction): `👀` once Firstmate acknowledges the note (`fm-inbox.sh drain --ack`), then `👌` once the note is completed, meaning the bridge delivers a reply recorded for it with `fm-inbox.sh reply`. Telegram's allowed reaction list has no ✅, so `👌` stands in for a check. Each reaction is attempted once and never repeated after a restart, an acknowledgement that arrives after the reply leaves `👌` in place, and if Telegram rejects a reaction the bridge sends no extra message. Firstmate can also push a notification at any time:
 
 ```sh
 python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Deploy finished'
@@ -197,7 +197,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 |------|------|----------|
 | `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), and, with `fleet_alerts`, the fleet ledger offset. Saves merge only changed keys under a lock so another process cannot erase them. |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram with their source message and which status reactions were attempted, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), and, with `fleet_alerts`, the fleet ledger offset. Saves merge only changed keys under a lock so another process cannot erase them. |
 | `…/pending-choices.json` | 0600 | Pending inline-choice state (for up to seven days), written atomically by `notify` and read fresh for every callback. |
 | `…/sent-prs.txt` | 0600 | With `fleet_alerts`: PR URLs already sent to you, one per line. Never pruned. |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |

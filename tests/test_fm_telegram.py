@@ -445,6 +445,39 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([(OWNER, "Received. Note ID: note-tg:45")], self.api.sent)
         self.assertEqual(["note-tg:45"], self.state.data["telegram_acknowledged_note_ids"])
 
+    def test_replied_note_moves_from_seen_to_done_once(self):
+        self.bridge.process_update(update(46, OWNER, "task"))
+        self.inbox.reply_rows = [{"id": "note-tg:46", "body": "finished", "cursor": "000000000001"}]
+        receipts = self.inbox.receipts
+        self.inbox.receipts = lambda cursor, all_handled=False: dict(
+            receipts(cursor), handled=[{"id": "note-tg:46", "acknowledged": True}])
+        self.bridge.check_replies()
+        self.assertEqual([(OWNER, 46, "👀"), (OWNER, 46, fm.DONE_REACTION)], self.api.reactions)
+        restarted = fm.Bridge(self.api, self.inbox, fm.State(self.state.directory), OWNER,
+                              fm.Redactor(), self.bridge.log)
+        restarted.check_replies()
+        self.assertEqual(2, len(self.api.reactions))
+        self.assertEqual(["note-tg:46"], restarted.state.data["telegram_completed_note_ids"])
+
+    def test_acknowledgement_after_reply_keeps_done_reaction(self):
+        self.bridge.process_update(update(47, OWNER, "task"))
+        self.inbox.reply_rows = [{"id": "note-tg:47", "body": "finished", "cursor": "000000000001"}]
+        self.bridge.check_replies()
+        receipts = self.inbox.receipts
+        self.inbox.receipts = lambda cursor, all_handled=False: dict(
+            receipts(cursor), handled=[{"id": "note-tg:47", "acknowledged": True}])
+        self.bridge.check_replies()
+        self.assertEqual([(OWNER, 47, fm.DONE_REACTION)], self.api.reactions)
+
+    def test_failed_done_reaction_still_delivers_reply_without_retry(self):
+        self.bridge.process_update(update(48, OWNER, "task"))
+        self.inbox.reply_rows = [{"id": "note-tg:48", "body": "finished", "cursor": "000000000001"}]
+        self.api.set_reaction = lambda *_args: (_ for _ in ()).throw(fm.TelegramAPIError("nope"))
+        self.bridge.check_replies()
+        self.bridge.check_replies()
+        self.assertEqual("finished", self.api.sent[-1][1])
+        self.assertEqual(["note-tg:48"], self.state.data["telegram_completed_note_ids"])
+
     def test_splitting_and_redaction(self):
         self.bridge.send("ghp_abcdefghijklmnop " + "x" * 5000)
         self.assertGreaterEqual(len(self.api.sent), 2)
