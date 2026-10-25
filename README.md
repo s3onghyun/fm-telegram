@@ -37,7 +37,7 @@ macOS is the primary platform (Keychain, LaunchAgents, `afconvert`). The bridge 
 
 ## Setup
 
-On Linux, skip the `security` command in step 2 and export `FM_TELEGRAM_BOT_TOKEN` instead, and in step 6 run the bridge in a terminal, tmux or a systemd user service: `./install.sh --agent` is macOS-only. To try the bridge without Telegram first, see [Try it without Telegram](#try-it-without-telegram).
+On Linux, skip the `security` command in step 2 and provide `FM_TELEGRAM_BOT_TOKEN` through your user-service secret mechanism. The reproducible deployment assets support launchd and systemd; see [Deployment assets](#deployment-assets). To try the bridge without Telegram first, see [Try it without Telegram](#try-it-without-telegram).
 
 1. **Create a bot.** In Telegram, talk to [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token. Send any message to your new bot so it has something to deliver.
 
@@ -49,12 +49,12 @@ On Linux, skip the `security` command in step 2 and export `FM_TELEGRAM_BOT_TOKE
 
    Elsewhere, export `FM_TELEGRAM_BOT_TOKEN` in the environment that starts the bridge.
 
-3. **Install.** This copies `fm_telegram.py` and `oss_watch.py` to `~/.local/share/fm-telegram/` (mode 0700). It does not load anything.
+3. **Install.** This writes the checked-out revision to a versioned, mode-0700 release directory and atomically points `current` at it. It does not load a service until you request one.
 
    ```sh
    git clone https://github.com/s3onghyun/fm-telegram.git
    cd fm-telegram
-   ./install.sh
+   ./deploy/install.sh
    ```
 
 4. **Write the config.** `owner_chat_id` is the one chat allowed to talk to the bridge; use `0` until you know it. `firstmate_home` is your Firstmate checkout.
@@ -84,13 +84,13 @@ On Linux, skip the `security` command in step 2 and export `FM_TELEGRAM_BOT_TOKE
    python3 ~/.local/share/fm-telegram/fm_telegram.py run
    ```
 
-   Or, on macOS only, load it as a per-user LaunchAgent (logs go to `~/Library/Logs/fm-telegram.log`). Without `launchctl`, `install.sh --agent` stops with an error before installing anything:
+   Or use the reproducible per-user service installation. On macOS it keeps the token in the Keychain and logs to `~/Library/Logs/fm-telegram.log`:
 
    ```sh
-   ./install.sh --agent bridge
+   ./deploy/install.sh --launchd
    ```
 
-   macOS privacy protection stops LaunchAgents from reading `~/Documents`, `~/Desktop` and iCloud Drive. If your Firstmate home lives there, run the bridge in a terminal instead of granting Python Full Disk Access.
+   On Linux, create a mode-0600 `~/.config/fm-telegram/runtime.env` containing `FM_TELEGRAM_BOT_TOKEN=...` (preferably maintained by your secret manager), then run `./deploy/install.sh --systemd`. macOS privacy protection stops LaunchAgents from reading `~/Documents`, `~/Desktop` and iCloud Drive. If your Firstmate home lives there, run the bridge in a terminal instead of granting Python Full Disk Access.
 
    To remove an agent: `launchctl bootout "gui/$(id -u)/io.github.fm-telegram.fm-telegram"` and delete its plist from `~/Library/LaunchAgents/`.
 
@@ -204,6 +204,10 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
 
 The bot token is never written to any of these files or to logs.
+
+## Deployment assets
+
+For reproducible release installation, launchd/systemd templates, and a deliberately local-only container/Kubernetes PoC shape, see [deploy/README.md](deploy/README.md). These assets version the installed bridge from the checked-out revision and make the Firstmate-home dependency explicit; they do not make the bridge portable to a shared cluster.
 
 ## Voice transcription
 

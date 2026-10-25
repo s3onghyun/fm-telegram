@@ -1,0 +1,73 @@
+# Local-PoC shape only. It is not a portable, cluster-ready Firstmate deployment:
+# /firstmate must expose a compatible, writable Firstmate home to this pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fm-telegram-state
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fm-telegram-config
+data:
+  config.json: |
+    {
+      "owner_chat_id": 0,
+      "firstmate_home": "/firstmate",
+      "doorbell": false
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fm-telegram
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: fm-telegram}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fm-telegram}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: bridge
+          image: fm-telegram:local # replace with an immutable image reference
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: FM_TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: fm-telegram, key: token}
+            - name: FM_TELEGRAM_CONFIG
+              value: /config/config.json
+            - name: FM_TELEGRAM_STATE_DIR
+              value: /state
+            - name: FM_HOME
+              value: /firstmate
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: firstmate-home, mountPath: /firstmate}
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: fm-telegram-state}
+        - name: config
+          configMap: {name: fm-telegram-config}
+        # Substitute a local-only, writable Firstmate home mount. Do not apply this
+        # manifest to a shared/company cluster: hostPath is node-local coupling.
+        - name: firstmate-home
+          hostPath: {path: /srv/firstmate, type: Directory}

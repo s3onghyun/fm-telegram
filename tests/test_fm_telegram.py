@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -125,6 +126,29 @@ class FakeResponse(io.BytesIO):
 
     def __exit__(self, *_exc):
         return False
+
+
+class DeploymentAssetsTests(unittest.TestCase):
+    def test_versioned_installer_is_idempotent_and_updates_current_atomically(self):
+        root = Path(fm.__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            env = dict(os.environ, FM_TELEGRAM_DATA_DIR=str(data))
+            command = [str(root / "deploy" / "install.sh"), "--version", "test-v1"]
+            subprocess.run(command, env=env, text=True, check=True, capture_output=True)
+            subprocess.run(command, env=env, text=True, check=True, capture_output=True)
+            self.assertEqual("releases/test-v1", os.readlink(data / "current"))
+            self.assertEqual(0o700, (data / "releases" / "test-v1").stat().st_mode & 0o777)
+            self.assertTrue((data / "current" / "fm_telegram.py").is_file())
+
+    def test_container_and_pod_templates_keep_state_and_token_external(self):
+        root = Path(fm.__file__).resolve().parent
+        container = (root / "Containerfile").read_text()
+        pod = (root / "deploy" / "kubernetes" / "fm-telegram.yaml").read_text()
+        self.assertIn("USER 10001:10001", container)
+        self.assertIn("secretKeyRef", pod)
+        self.assertIn("persistentVolumeClaim", pod)
+        self.assertIn("readOnlyRootFilesystem: true", pod)
 
 
 class BridgeTests(unittest.TestCase):
