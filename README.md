@@ -107,7 +107,7 @@ On Linux, skip the `security` command in step 2 and provide `FM_TELEGRAM_BOT_TOK
    ./deploy/install.sh --launchd
    ```
 
-   On Linux, create a mode-0600 `~/.config/fm-telegram/runtime.env` containing `FM_TELEGRAM_BOT_TOKEN=...` (preferably maintained by your secret manager), then run `./deploy/install.sh --systemd`. macOS privacy protection stops LaunchAgents from reading `~/Documents`, `~/Desktop` and iCloud Drive. If your Firstmate home lives there, run the bridge in a terminal instead of granting Python Full Disk Access.
+   On Linux, create a mode-0600 `~/.config/fm-telegram/runtime.env` containing `FM_TELEGRAM_BOT_TOKEN=...` (preferably maintained by your secret manager), then run `./deploy/install.sh --systemd`. macOS privacy protection stops LaunchAgents from reading `~/Documents`, `~/Desktop` and iCloud Drive. If your Firstmate home lives there, either run the bridge in a terminal or give the LaunchAgent a dedicated interpreter (`--python`) and allow that one binary the folder when macOS asks; never grant Python Full Disk Access. See [deploy/README.md](deploy/README.md#macos-a-dedicated-interpreter-for-the-launchagent).
 
    To remove an agent: `launchctl bootout "gui/$(id -u)/io.github.fm-telegram.fm-telegram"` and delete its plist from `~/Library/LaunchAgents/`.
 
