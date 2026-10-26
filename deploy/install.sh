@@ -4,7 +4,7 @@
 set -eu
 
 usage() {
-  echo "usage: $0 [--data-dir DIR] [--version VERSION] [--launchd | --systemd]" >&2
+  echo "usage: $0 [--data-dir DIR] [--version VERSION] [--python PATH] [--launchd | --systemd]" >&2
   exit 2
 }
 
@@ -12,6 +12,9 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python=$(command -v python3) || { echo "$0: python3 is required" >&2; exit 1; }
 data_dir=${FM_TELEGRAM_DATA_DIR:-"${XDG_DATA_HOME:-$HOME/.local/share}/fm-telegram"}
 label=${FM_TELEGRAM_LABEL:-io.github.fm-telegram.fm-telegram}
+# The interpreter the LaunchAgent runs. TCC grants ~/Documents access to the launched
+# binary, so a dedicated copy keeps that grant away from every other python3 user.
+service_python=${FM_TELEGRAM_PYTHON:-$python}
 service=""
 version=""
 
@@ -19,11 +22,19 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --data-dir) data_dir=${2:?missing data directory}; shift 2 ;;
     --version) version=${2:?missing version}; shift 2 ;;
+    --python) service_python=${2:?missing python}; shift 2 ;;
     --launchd) [ -z "$service" ] || usage; service=launchd; shift ;;
     --systemd) [ -z "$service" ] || usage; service=systemd; shift ;;
     *) usage ;;
   esac
 done
+
+if [ "$service" = launchd ]; then
+  case "$service_python" in
+    /*) [ -f "$service_python" ] && [ -x "$service_python" ] ;;
+    *) false ;;
+  esac || { echo "$0: --python must be an absolute path to an executable file" >&2; exit 2; }
+fi
 
 if [ -z "$version" ]; then
   version=$(git -C "$root" rev-parse --verify --short=12 HEAD 2>/dev/null || true)
@@ -61,13 +72,15 @@ echo "installed fm-telegram release $version in $release"
 
 render() {
   template=$1 output=$2 app_dir=$3 log_dir=${4:-}
-  "$python" - "$template" "$output" "$label" "$app_dir" "$log_dir" <<'PY'
+  "$python" - "$template" "$output" "$label" "$app_dir" "$log_dir" "$service_python" <<'PY'
 import pathlib
 import sys
-template, output, label, app_dir, log_dir = sys.argv[1:]
+from xml.sax.saxutils import escape
+template, output, label, app_dir, log_dir, service_python = sys.argv[1:]
 text = pathlib.Path(template).read_text()
-for key, value in {"@LABEL@": label, "@APP_DIR@": app_dir, "@LOG_DIR@": log_dir}.items():
-    text = text.replace(key, value)
+for key, value in {"@LABEL@": label, "@APP_DIR@": app_dir, "@LOG_DIR@": log_dir,
+                   "@PYTHON@": service_python}.items():
+    text = text.replace(key, escape(value) if output.endswith(".plist") else value)
 path = pathlib.Path(output)
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(text)

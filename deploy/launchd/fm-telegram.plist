@@ -7,8 +7,11 @@
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>Umask</key><integer>63</integer>
+  <!-- Standard, not Background: voice transcription is work the owner is waiting for. -->
+  <key>ProcessType</key><string>Standard</string>
+  <!-- Run the interpreter directly: TCC attributes file access to this exact binary. -->
   <key>ProgramArguments</key><array>
-    <string>/usr/bin/env</string><string>python3</string><string>@APP_DIR@/fm_telegram.py</string><string>run</string>
+    <string>@PYTHON@</string><string>@APP_DIR@/fm_telegram.py</string><string>run</string>
   </array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>@LOG_DIR@/fm-telegram.log</string>
