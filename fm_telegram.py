@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import getpass
 import html
 import json
 import logging
@@ -12,6 +13,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -333,18 +335,35 @@ def transcribe(path: Path, whisper: str, model: Path, language: str = "auto") ->
     return " ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
-def read_token(service: str) -> str:
-    """Read the token from the environment or the macOS login Keychain; never persist it."""
+def _env_file_token(env_file: Optional[Path]) -> str:
+    """Read FM_TELEGRAM_BOT_TOKEN from a systemd-style runtime.env, if there is one."""
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines() if env_file else []
+    except FileNotFoundError:
+        return ""
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == TOKEN_ENV:
+            return value.strip().strip("'\"")
+    return ""
+
+
+def read_token(service: str, env_file: Optional[Path] = None,
+               runner: Callable[..., Any] = subprocess.run) -> str:
+    """Read the token from the environment, the macOS login Keychain or runtime.env."""
     token = os.environ.get(TOKEN_ENV, "").strip()
     if token:
         return token
     try:
-        result = subprocess.run(
+        result = runner(
             ["security", "find-generic-password", "-s", service,
              "-a", os.environ.get("USER", ""), "-w"],
             check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
+        token = _env_file_token(env_file)
+        if token:
+            return token
         raise RuntimeError("no Telegram bot token: set %s or add Keychain item %r"
                            % (TOKEN_ENV, service)) from exc
     token = result.stdout.strip()
@@ -602,7 +621,7 @@ class State:
             return dict(fallback)
 
     @staticmethod
-    def _write(path: Path, data: dict[str, Any]) -> None:
+    def _write(path: Path, data: dict[str, Any], indent: Optional[int] = None) -> None:
         # A unique temporary name matters because notify and run are separate
         # processes.  os.replace makes every completed write all-or-nothing.
         descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
@@ -610,7 +629,8 @@ class State:
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, separators=(",", ":"))
+                json.dump(data, handle, indent=indent,
+                          separators=None if indent else (",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.replace(path)
@@ -1426,7 +1446,7 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     if not home:
         raise RuntimeError("set firstmate_home in the config (or FM_HOME / --home)")
     state = State(args.state_dir)
-    token = read_token(str(config["keychain_service"]))
+    token = read_token(str(config["keychain_service"]), args.config.parent / "runtime.env")
     redactor = Redactor(_path(config["denylist_file"]), secrets=[token])
     logger = logger_for(redactor)
     doorbell = Doorbell(home, bool(config["doorbell"]), logger, agent=config["doorbell_agent"])
@@ -1453,6 +1473,314 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     return bridge, config
 
 
+SETUP_NEEDS_HUMAN = 3  # Exit code: a person has to act, then `setup` can simply be run again.
+SELF_TEST = ("fm-telegram is connected ✅\n"
+             "Send me anything now: it becomes a Firstmate note and I answer with its id.")
+# macOS privacy protection (TCC) hides these from LaunchAgents unless granted Full Disk Access.
+TCC_FOLDERS = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
+WHISPER_MODEL_URL = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+                     "ggml-large-v3-turbo-q5_0.bin")
+
+
+class NeedsHuman(RuntimeError):
+    """Setup cannot go on until a person does something; the message says what."""
+    def __init__(self, step: str, message: str) -> None:
+        super().__init__(message)
+        self.step = step
+
+
+def tcc_protected(path: Path, platform: str = sys.platform) -> Optional[str]:
+    """Name the macOS-protected folder (e.g. Documents) that contains path, if any."""
+    if platform != "darwin":
+        return None
+    resolved = path.expanduser().resolve()
+    for folder in TCC_FOLDERS:
+        try:
+            resolved.relative_to((Path.home() / folder).resolve())
+            return "~/" + folder
+        except ValueError:
+            continue
+    return None
+
+
+def _is_firstmate_home(path: Path) -> bool:
+    return os.access(str(path / "bin/fm-inbox.sh"), os.X_OK)
+
+
+class Setup:
+    """Interactive, re-runnable setup. Each progress line reads `setup <step> <status>: ...`."""
+    def __init__(self, args: argparse.Namespace, out: Any = None,
+                 api_factory: Callable[..., Any] = TelegramAPI,
+                 runner: Callable[..., Any] = subprocess.run,
+                 secret: Callable[[str], str] = getpass.getpass,
+                 ask: Callable[[str], str] = input,
+                 interactive: Optional[bool] = None, platform: str = sys.platform,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+        self.args, self.out = args, out or sys.stdout
+        self.api_factory, self.runner, self.secret, self.ask = api_factory, runner, secret, ask
+        self.interactive = sys.stdin.isatty() if interactive is None else interactive
+        self.platform, self.clock, self.sleep = platform, clock, sleep
+        self.redactor = Redactor()
+        self.env_file = args.config.parent / "runtime.env"
+
+    def step(self, name: str, status: str, message: str) -> None:
+        print(self.redactor.redact("setup %s %s: %s" % (name, status, message)),
+              file=self.out, flush=True)
+
+    def confirm(self, question: str) -> bool:
+        if self.args.yes:
+            return True
+        if not self.interactive:
+            return False
+        return self.ask(question + " [y/N] ").strip().lower() in {"y", "yes"}
+
+    def run(self) -> int:
+        try:
+            return self._run()
+        except NeedsHuman as exc:
+            self.step(exc.step, "need-human", str(exc))
+            return SETUP_NEEDS_HUMAN
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            self.step("setup", "fail", str(exc))
+            return 1
+
+    def _run(self) -> int:
+        try:
+            existing = json.loads(self.args.config.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            existing = {}
+        except ValueError as exc:
+            raise RuntimeError("config is not valid JSON: %s" % self.args.config) from exc
+        if not isinstance(existing, dict):
+            raise RuntimeError("config must be a JSON object: %s" % self.args.config)
+        config = {**CONFIG_DEFAULTS, **existing}
+        home = None if self.args.token_only else self.find_home(config["firstmate_home"])
+        if home:
+            self.step("home", "ok", "Firstmate home %s" % home)
+        api, token, bot = self.token(str(config["keychain_service"]),
+                                     _check_api_base(str(config["api_base"])))
+        self.redactor = Redactor(secrets=[token])
+        self.step("token", "ok", "bot @%s" % bot)
+        if not home:
+            return 0
+        owner = existing.get("owner_chat_id")
+        if isinstance(owner, int) and not isinstance(owner, bool) and owner:
+            self.step("owner", "ok", "owner_chat_id already set; kept")
+        else:
+            owner = self.detect_owner(api, bot)
+        updated = {**existing, "owner_chat_id": owner, "firstmate_home": str(home)}
+        updated.setdefault("doorbell", bool(shutil.which("herdr")))
+        if updated != existing or not self.args.config.exists():
+            self.args.config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            State._write(self.args.config, updated, indent=2)
+            self.step("config", "ok", "wrote %s (mode 0600)" % self.args.config)
+        else:
+            os.chmod(self.args.config, 0o600)
+            self.step("config", "ok", "%s unchanged" % self.args.config)
+        self.check_voice({**config, **updated})
+        mode = self.install(home)
+        return self.self_test(api, owner, mode)
+
+    def find_home(self, configured: Any) -> Path:
+        explicit = self.args.firstmate_home or self.args.home
+        if explicit:
+            candidates = [explicit.expanduser()]  # Asked for by name: never fall back elsewhere.
+        else:
+            cwd = Path.cwd()
+            candidates = [path for path in (_path(configured), cwd, *cwd.parents,
+                                            Path.home() / "firstmate") if path]
+        for path in candidates:
+            if _is_firstmate_home(path):
+                return path.resolve()
+        raise RuntimeError("no Firstmate home with an executable bin/fm-inbox.sh at %s; pass "
+                           "--firstmate-home <path to your firstmate clone>"
+                           % ", ".join(str(path) for path in candidates[:3]))
+
+    def token(self, service: str, base: str) -> tuple[Any, str, str]:
+        """Return a verified API client, its token and the bot's username."""
+        try:
+            stored = read_token(service, self.env_file, self.runner)
+        except RuntimeError:
+            stored = ""
+        if stored:
+            try:
+                return self._verified(stored, base)
+            except TelegramAPIError:
+                self.step("token", "retry", "the stored token was rejected by Telegram")
+        if not self.interactive:
+            raise NeedsHuman("token", "no working bot token. In your own terminal (not through "
+                             "an agent), run: python3 %s setup --token-only   then paste the "
+                             "token from @BotFather; input is hidden." % Path(__file__).resolve())
+        for _attempt in range(3):
+            value = self.secret("Bot token from @BotFather (input hidden): ").strip()
+            if not TOKEN_PATTERNS[0].fullmatch(value):
+                self.step("token", "retry", "that is not a bot token (digits:letters)")
+                continue
+            try:
+                verified = self._verified(value, base)
+            except TelegramAPIError:
+                self.step("token", "retry", "Telegram rejected that token")
+                continue
+            self.store_token(service, value)
+            return verified
+        raise RuntimeError("no valid bot token after 3 attempts")
+
+    def _verified(self, token: str, base: str) -> tuple[Any, str, str]:
+        api = self.api_factory(token, base=base)
+        bot = api.call("getMe", {}) or {}
+        return api, token, str(bot.get("username") or bot.get("first_name") or "?")
+
+    def store_token(self, service: str, token: str) -> None:
+        if self.platform == "darwin":
+            user = os.environ.get("USER", "")
+            if not re.fullmatch(r"[\w.@-]+", service) or not re.fullmatch(r"[\w.@-]+", user):
+                raise RuntimeError("keychain_service and $USER must be plain names")
+            # `security -i` reads the command from stdin, so the token never appears in argv.
+            self.runner(["security", "-i"], input='add-generic-password -U -s "%s" -a "%s" -w "%s"\n'
+                        % (service, user, token), text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=True)
+            where = "macOS Keychain item %r" % service
+        else:
+            self.env_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(dir=str(self.env_file.parent))
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:  # mkstemp is 0600.
+                handle.write("%s=%s\n" % (TOKEN_ENV, token))
+            os.replace(temporary, self.env_file)
+            where = "%s (mode 0600)" % self.env_file
+        if read_token(service, self.env_file, self.runner) != token:
+            raise RuntimeError("the token could not be read back from %s" % where)
+        self.step("token", "ok", "stored in %s" % where)
+
+    def detect_owner(self, api: Any, bot: str) -> int:
+        if not self.interactive and not self.args.yes:
+            raise NeedsHuman("owner", "owner_chat_id is not set. Run setup in a terminal, or "
+                             "add --yes to accept the first private message to @%s" % bot)
+        try:
+            # Skip the backlog: only a message sent now shows who is setting this bot up.
+            backlog = api.call("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}) or []
+            offset = max((item["update_id"] for item in backlog), default=-1) + 1
+            self.step("owner", "need-human", "send any message to @%s from your own Telegram "
+                      "account, in a private chat (waiting %ds)" % (bot, self.args.wait))
+            deadline = self.clock() + self.args.wait
+            while self.clock() < deadline:
+                timeout = max(0, min(30, int(deadline - self.clock())))
+                updates = api.call("getUpdates", {"offset": offset, "timeout": timeout,
+                                                  "allowed_updates": ["message"]}) or []
+                for item in updates:
+                    offset = max(offset, item["update_id"] + 1)
+                    chat = (item.get("message") or {}).get("chat") or {}
+                    if chat.get("type") != "private" or not isinstance(chat.get("id"), int):
+                        self.step("owner", "skip", "ignored a message from a %s chat; only a "
+                                  "private chat can own the bridge" % chat.get("type", "unknown"))
+                        continue
+                    who = " ".join(part for part in (chat.get("first_name"), chat.get("last_name"))
+                                   if part) or "?"
+                    if chat.get("username"):
+                        who += " (@%s)" % chat["username"]
+                    if self.confirm("Message from %s. Is this your account?" % who):
+                        # Acknowledge it, so the bridge does not later turn it into a note.
+                        api.call("getUpdates", {"offset": offset, "timeout": 0})
+                        self.step("owner", "ok", "owner is %s, chat id %d" % (who, chat["id"]))
+                        return chat["id"]
+                    self.step("owner", "skip", "not confirmed; waiting for another message")
+                if not updates:
+                    self.sleep(1)
+        except TelegramAPIError as exc:
+            if "409" in str(exc):
+                raise RuntimeError("Telegram reports another reader of this bot (a running "
+                                   "bridge or a webhook); stop it and run setup again") from None
+            raise
+        raise NeedsHuman("owner", "no private message reached @%s in %ds; send one and run "
+                         "setup again" % (bot, self.args.wait))
+
+    def check_voice(self, config: dict[str, Any]) -> None:
+        if self.platform != "darwin":
+            self.step("voice", "skip", "local transcription needs macOS; voice notes arrive as "
+                      "attachments")
+            return
+        model = _path(config["whisper_model"]) or Path()
+        commands = [] if config["whisper_cli"] or shutil.which("whisper-cli") else \
+            ["brew install whisper-cpp"]
+        if not model.is_file():
+            commands += ["mkdir -p '%s'" % model.parent,
+                         "curl -fL -o '%s' %s   # about 0.5 GB" % (model, WHISPER_MODEL_URL)]
+        if commands:
+            self.step("voice", "optional", "to transcribe voice notes on this Mac, run: "
+                      + " && ".join(commands))
+        else:
+            self.step("voice", "ok", "whisper-cli and model found")
+
+    def install(self, home: Path) -> str:
+        """Install a release and pick how the bridge keeps running: service, terminal or none."""
+        mode = self.args.run_mode
+        blocked = tcc_protected(home, self.platform)
+        manager = "launchctl" if self.platform == "darwin" else "systemctl"
+        if blocked and mode in ("auto", "service"):
+            reason = ("the Firstmate home is under %s, which macOS privacy protection (TCC) hides "
+                      "from LaunchAgents: the agent would start but every fm-inbox.sh call would "
+                      "fail. Run the bridge in a terminal instead, or move the Firstmate home out "
+                      "of ~/Desktop, ~/Documents, ~/Downloads and iCloud Drive" % blocked)
+            if mode == "service":
+                raise RuntimeError(reason)
+            self.step("run-mode", "warn", reason)
+            mode = "terminal"
+        if mode == "auto":
+            wanted = shutil.which(manager) and self.confirm(
+                "Start the bridge at login with a %s user service?" % manager)
+            mode = "service" if wanted else "terminal"
+        if mode == "none":
+            self.step("run-mode", "skip", "nothing installed (--run-mode none)")
+            return mode
+        installer = Path(__file__).resolve().parent / "deploy/install.sh"
+        if not installer.is_file():
+            raise RuntimeError("run setup from a git checkout of fm-telegram (deploy/install.sh "
+                               "is missing next to %s)" % Path(__file__).name)
+        flag = ["--launchd" if self.platform == "darwin" else "--systemd"] if mode == "service" else []
+        try:
+            self.runner([str(installer), *flag], text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError("deploy/install.sh failed: %s" % (exc.stderr or "").strip()) from None
+        if mode == "service":
+            self.step("run-mode", "ok", "installed and started the %s service" % manager)
+            return mode
+        program = Path(os.environ.get("FM_TELEGRAM_DATA_DIR") or DATA_DIR) / "current/fm_telegram.py"
+        command = ["python3", str(program)]
+        if self.args.config != DEFAULT_CONFIG:
+            command += ["--config", str(self.args.config)]
+        if self.args.state_dir != DEFAULT_STATE:
+            command += ["--state-dir", str(self.args.state_dir)]
+        command_line = " ".join(shlex.quote(part) for part in command + ["run"])
+        self.step("run-mode", "action", "installed; keep this running in a terminal, tmux or "
+                  "Herdr pane: %s   (for example: tmux new-session -d -s fm-telegram %s)"
+                  % (command_line, command_line))
+        return mode
+
+    def self_test(self, api: Any, owner: int, mode: str) -> int:
+        api.send(owner, SELF_TEST)
+        self.step("self-test", "ok", "sent a test message to the owner chat")
+        if mode != "service":
+            self.step("done", "ok", "once the bridge runs, send the bot a message: the reply "
+                      "'Received. Note ID: <id>' means it reached fm-inbox")
+            return 0
+        known = set(State._load(self.args.state_dir / "state.json", {}).get("telegram_note_ids", []))
+        self.step("self-test", "need-human", "send the bot any message to check the round trip "
+                  "(waiting %ds)" % self.args.wait)
+        deadline = self.clock() + self.args.wait
+        while self.clock() < deadline:
+            state = State._load(self.args.state_dir / "state.json", {})
+            new = [note for note in state.get("telegram_note_ids", []) if note not in known]
+            if new:
+                self.step("done", "ok", "round trip works: Telegram message became note %s"
+                          % new[-1])
+                return 0
+            self.sleep(2)
+        raise NeedsHuman("self-test", "no note arrived in %ds. Check the log (~/Library/Logs/"
+                         "fm-telegram.log or journalctl --user), then send a message and run "
+                         "setup again" % self.args.wait)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path,
@@ -1466,7 +1794,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     notify.add_argument("text", help="notification text, or - to read stdin")
     notify.add_argument("--choice", action="append", default=[], metavar="QUESTION:OPTION=LABEL",
                         help="add an inline button; repeat for each option")
+    setup = sub.add_parser("setup", help="create or check the config, token, owner chat and "
+                           "run mode; safe to run again")
+    setup.add_argument("--firstmate-home", type=Path, help="Firstmate home with bin/fm-inbox.sh")
+    setup.add_argument("--run-mode", choices=["auto", "service", "terminal", "none"],
+                       default="auto", help="service: launchd/systemd; terminal: print the "
+                       "command for a pane; auto: service unless macOS privacy blocks it")
+    setup.add_argument("--yes", action="store_true",
+                       help="accept the first private chat and the service without asking")
+    setup.add_argument("--token-only", action="store_true",
+                       help="only store and verify the bot token")
+    setup.add_argument("--wait", type=int, default=300,
+                       help="seconds to wait for a Telegram message (default 300)")
     args = parser.parse_args(argv)
+    if args.command == "setup":
+        return Setup(args).run()
     bridge, config = build_bridge(args)
     if args.command == "notify":
         text = sys.stdin.read() if args.text == "-" else args.text

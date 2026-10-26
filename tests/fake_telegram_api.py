@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A local stand-in for the Telegram Bot API, for end-to-end tests without a real bot.
 
-Bot methods: getUpdates, sendMessage, getFile and the /file/ download path. Test control:
+Bot methods: getMe, getUpdates, sendMessage, getFile and the /file/ download path. Test control:
 POST /_control/updates (a JSON update to queue), POST /_control/files ({"path", "text" or "base64"}),
 GET /_control/sent (messages the bridge sent). Requests with the wrong token get HTTP 401.
 """
@@ -67,6 +67,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self.path.startswith(prefix):
                 return self.reply(401, {"ok": False, "description": "Unauthorized"})
             method = self.path[len(prefix):]
+            if method == "getMe":
+                return self.reply(200, {"ok": True, "result": {
+                    "id": 1, "is_bot": True, "first_name": "Fake", "username": "fake_fm_bot"}})
             if method == "getUpdates":
                 pending = [item for item in server.updates if item["update_id"] >= body.get("offset", 0)]
                 return self.reply(200, {"ok": True, "result": pending})

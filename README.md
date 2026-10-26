@@ -10,6 +10,21 @@ An out-of-tree bridge built only on `fm-inbox.sh` note, receipts and ready, it c
 - Text, photos, files, voice notes and videos. Voice is transcribed **on your machine** with whisper.cpp.
 - Outbound text is redacted (tokens, keys, your own denylist) and rendered as safe Telegram HTML.
 
+## Quick start: let your coding agent set it up
+
+If you already run Firstmate, paste this to your coding agent (Claude Code, Codex, Pi, …):
+
+> Set up the fm-telegram bridge for my Firstmate: follow https://github.com/s3onghyun/fm-telegram/blob/main/docs/agent-setup.md. Never ask me to paste the bot token into this chat.
+
+The agent clones this repository, runs `python3 fm_telegram.py setup`, installs the bridge as a service (or tells you the command to keep running when macOS privacy protection rules a service out) and checks the connection. You do three things: create the bot with [@BotFather](https://t.me/BotFather), type its token once into your own terminal (hidden input), and send the bot one message so it learns your chat. [docs/agent-setup.md](docs/agent-setup.md) lists every step.
+
+Without an agent, run the same command yourself in a terminal; it asks for what it needs and is safe to run again:
+
+```sh
+git clone https://github.com/s3onghyun/fm-telegram.git ~/fm-telegram
+python3 ~/fm-telegram/fm_telegram.py setup --firstmate-home ~/firstmate
+```
+
 ## How it works
 
 ```text
@@ -29,13 +44,15 @@ Each Telegram update becomes `fm-inbox.sh note --request-id tg:<update_id>`, so 
 | A Firstmate home with `bin/fm-inbox.sh` | Notes and replies go through Firstmate's inbox. |
 | Python 3.8 or newer | Runs the bridge. No packages to install. |
 | A Telegram bot token from [@BotFather](https://t.me/BotFather) | The bot you message. |
-| macOS Keychain, or the `FM_TELEGRAM_BOT_TOKEN` environment variable | Where the token is read from. |
+| macOS Keychain, `~/.config/fm-telegram/runtime.env` (Linux), or the `FM_TELEGRAM_BOT_TOKEN` environment variable | Where the token is read from. |
 | Optional: `herdr` on `PATH` | The doorbell. Without it, notes still land in the inbox. |
 | Optional: macOS `afconvert` + `whisper-cli` + a model | Voice transcription (see below). |
 
 macOS is the primary platform (Keychain, LaunchAgents, `afconvert`). The bridge itself also runs on Linux with the token in `FM_TELEGRAM_BOT_TOKEN`; voice notes are then delivered as attachments with a "transcription failed" line.
 
-## Setup
+## Manual setup
+
+`fm_telegram.py setup` (above) does steps 2 to 6 for you. These are the same steps by hand.
 
 On Linux, skip the `security` command in step 2 and provide `FM_TELEGRAM_BOT_TOKEN` through your user-service secret mechanism. The reproducible deployment assets support launchd and systemd; see [Deployment assets](#deployment-assets). To try the bridge without Telegram first, see [Try it without Telegram](#try-it-without-telegram).
 
@@ -185,7 +202,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 
 | Environment variable | Meaning |
 |----------------------|---------|
-| `FM_TELEGRAM_BOT_TOKEN` | Bot token; takes precedence over the Keychain. |
+| `FM_TELEGRAM_BOT_TOKEN` | Bot token; takes precedence over the Keychain and `runtime.env`. |
 | `FM_TELEGRAM_CONFIG` | Config file path. |
 | `FM_TELEGRAM_STATE_DIR` | State directory (default `$XDG_STATE_HOME/fm-telegram`, i.e. `~/.local/state/fm-telegram`). |
 | `FM_HOME` | Firstmate home; overrides `firstmate_home`. |
@@ -195,7 +212,8 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 
 | Path | Mode | Contents |
 |------|------|----------|
-| `~/.config/fm-telegram/config.json` | 0600 (you create it) | Configuration. No secrets. |
+| `~/.config/fm-telegram/config.json` | 0600 (`setup` or you create it) | Configuration. No secrets. |
+| `~/.config/fm-telegram/runtime.env` | 0600 (Linux, `setup` or you create it) | `FM_TELEGRAM_BOT_TOKEN=…`, read by the systemd unit and, when the Keychain has no token, by the bridge. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
 | `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram with their source message and which status reactions were attempted, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), and, with `fleet_alerts`, the fleet ledger offset. Saves merge only changed keys under a lock so another process cannot erase them. |
 | `…/pending-choices.json` | 0600 | Pending inline-choice state (for up to seven days), written atomically by `notify` and read fresh for every callback. |
@@ -203,7 +221,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
 | `~/.local/share/fm-telegram/` | 0700 | Installed programs and (optionally) the whisper model. |
 
-The bot token is never written to any of these files or to logs.
+The bot token is never written to any of these files or to logs, except `runtime.env` on Linux, which exists to hold it.
 
 ## Deployment assets
 
@@ -298,7 +316,7 @@ State is kept in `~/.local/state/fm-telegram/oss-watch.json` (0600).
 
 - **Who can talk to it:** only `owner_chat_id`. Other chats are ignored before any download, note or reply; only their numeric id is logged.
 - **What runs:** no shell is ever used. Message text reaches `fm-inbox.sh` on stdin; the only argument derived from Telegram is the integer update id. Downloads are written only inside `media/` under generated names.
-- **Secrets:** the token is read from the Keychain or the environment at start-up, used only in request URLs, and redacted from logs and outbound messages along with common token formats.
+- **Secrets:** the token is read from the Keychain, the environment or (Linux) the 0600 `runtime.env` at start-up; `setup` reads it with hidden input and stores it through `security -i` on stdin, so it never appears in a command line. It is used only in request URLs, and redacted from logs and outbound messages along with common token formats.
 - **Network:** outbound HTTPS to `api.telegram.org` only. No listening socket.
 
 Telegram is convenient, not confidential: messages are stored on Telegram's servers and bot chats are not end-to-end encrypted. Do not send customer data, raw logs, diffs, private paths or secrets through it; read those on the machine itself (for example over SSH). The redaction filter is a safety net, not permission to send sensitive text.
