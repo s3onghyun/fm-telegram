@@ -4,19 +4,20 @@
 set -eu
 
 usage() {
-  echo "usage: $0 [--data-dir DIR] [--version VERSION] [--python PATH] [--launchd | --systemd]" >&2
+  echo "usage: $0 [--data-dir DIR] [--version VERSION] [--python PATH] [--launchd | --systemd [--standby]]" >&2
   exit 2
 }
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python=$(command -v python3) || { echo "$0: python3 is required" >&2; exit 1; }
 data_dir=${FM_TELEGRAM_DATA_DIR:-"${XDG_DATA_HOME:-$HOME/.local/share}/fm-telegram"}
-label=${FM_TELEGRAM_LABEL:-io.github.fm-telegram.fm-telegram}
+label=${FM_TELEGRAM_LABEL:-}
 # The interpreter the LaunchAgent runs. TCC grants ~/Documents access to the launched
 # binary, so a dedicated copy keeps that grant away from every other python3 user.
 service_python=${FM_TELEGRAM_PYTHON:-$python}
 service=""
 version=""
+command=run
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,9 +26,17 @@ while [ $# -gt 0 ]; do
     --python) service_python=${2:?missing python}; shift 2 ;;
     --launchd) [ -z "$service" ] || usage; service=launchd; shift ;;
     --systemd) [ -z "$service" ] || usage; service=systemd; shift ;;
+    # The fallback poller for an always-on second machine (docs/standby-fallback.md).
+    --standby) command="standby run"; shift ;;
     *) usage ;;
   esac
 done
+
+if [ "$command" != run ] && [ "$service" != systemd ]; then usage; fi
+[ -n "$label" ] || case "$command" in
+  run) label=io.github.fm-telegram.fm-telegram ;;
+  *) label=io.github.fm-telegram.fm-telegram-standby ;;
+esac
 
 if [ "$service" = launchd ]; then
   case "$service_python" in
@@ -72,14 +81,14 @@ echo "installed fm-telegram release $version in $release"
 
 render() {
   template=$1 output=$2 app_dir=$3 log_dir=${4:-}
-  "$python" - "$template" "$output" "$label" "$app_dir" "$log_dir" "$service_python" <<'PY'
+  "$python" - "$template" "$output" "$label" "$app_dir" "$log_dir" "$service_python" "$command" <<'PY'
 import pathlib
 import sys
 from xml.sax.saxutils import escape
-template, output, label, app_dir, log_dir, service_python = sys.argv[1:]
+template, output, label, app_dir, log_dir, service_python, command = sys.argv[1:]
 text = pathlib.Path(template).read_text()
 for key, value in {"@LABEL@": label, "@APP_DIR@": app_dir, "@LOG_DIR@": log_dir,
-                   "@PYTHON@": service_python}.items():
+                   "@PYTHON@": service_python, "@COMMAND@": command}.items():
     text = text.replace(key, escape(value) if output.endswith(".plist") else value)
 path = pathlib.Path(output)
 path.parent.mkdir(parents=True, exist_ok=True)

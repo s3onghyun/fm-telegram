@@ -66,6 +66,11 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "claude_probe_timeout_seconds": 90,
     "claude_probe_command": ["claude", "auth", "status"],
     "claude_auth_status_command": ["claude", "auth", "status"],
+    "failover_command": None,
+    "failover_interval_seconds": 60,
+    "standby_stale_seconds": 180,
+    "standby_reply": "맥이 자고 있어요 💤 깨면 처리할게요",
+    "standby_routes": {},
 }
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
@@ -104,6 +109,9 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-+*]|\d+[.)])\s+(.*)$")
 
 class TelegramAPIError(RuntimeError):
     """A response from Telegram was valid HTTP but rejected the message."""
+    def __init__(self, message: str, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code  # 409 means another getUpdates poller is running.
 
 
 class AttachmentTooLarge(RuntimeError):
@@ -455,7 +463,8 @@ class TelegramAPI:
         except HTTPError as exc:
             # Telegram reports rejections (bad entities, 401, 409, 429) as HTTP 4xx.
             exc.close()
-            raise TelegramAPIError("Telegram API rejected request (HTTP %d)" % exc.code) from None
+            raise TelegramAPIError("Telegram API rejected request (HTTP %d)" % exc.code,
+                                   exc.code) from None
         except (URLError, OSError, ValueError) as exc:
             raise RuntimeError("Telegram network request failed") from exc
         if not body.get("ok"):
@@ -975,6 +984,86 @@ class FleetAlerts:
             self.state.save()
 
 
+HEARTBEAT_FILE = "primary-heartbeat.json"
+QUEUE_FILE = "standby-queue.json"
+ACTIVE_LOCK = "standby-active.lock"
+
+
+def update_queue(state: State, change: Callable[[list[Any]], Any]) -> Any:
+    """Change the standby's durable queue of updates under its lock, all-or-nothing."""
+    with state._locked(state.directory / "standby-queue.lock"):
+        updates = State._load(state.directory / QUEUE_FILE, {}).get("updates")
+        updates = updates if isinstance(updates, list) else []
+        result = change(updates)
+        State._write(state.directory / QUEUE_FILE, {"updates": updates})
+        return result
+
+
+def standby_claim(state: State, primary_offset: int, wait: float = 60.0) -> dict[str, Any]:
+    """Primary side of a handoff, run on the standby machine: heartbeat, then report.
+
+    The heartbeat is written first, so once the active lock is ours the standby has
+    finished its current poll and will not start another while the heartbeat is fresh.
+    """
+    State._write(state.directory / HEARTBEAT_FILE, {"offset": primary_offset})
+    descriptor = os.open(state.directory / ACTIVE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "r+") as handle:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("the standby poller did not stop in time") from None
+                time.sleep(0.5)
+        offset = State._load(state.path, {}).get("offset", 0)
+        return {"offset": offset if isinstance(offset, int) else 0,
+                "updates": update_queue(state, list)}
+
+
+def standby_ack(state: State, last_update_id: int) -> None:
+    """Forget queued updates the primary has taken over (ids up to last_update_id)."""
+    def drop(updates: list[Any]) -> None:
+        updates[:] = [item for item in updates if item.get("update_id", 0) > last_update_id]
+    update_queue(state, drop)
+
+
+class Failover:
+    """Primary side of the standby fallback: heartbeat the standby and take over its queue."""
+    def __init__(self, command: list[str], interval: float,
+                 runner: Callable[..., Any] = subprocess.run,
+                 clock: Callable[[], float] = time.time) -> None:
+        # Wall-clock time, so a Mac that slept past the interval hands off before polling.
+        self.command, self.interval, self.runner, self.clock = command, interval, runner, clock
+        self.last: Optional[float] = None
+
+    def due(self) -> bool:
+        return self.last is None or self.clock() - self.last >= self.interval
+
+    def _call(self, *args: str) -> str:
+        result = self.runner([*self.command, "standby", *args], text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=120, check=False)
+        if result.returncode != 0:
+            raise RuntimeError("standby %s failed (exit %d)" % (args[0], result.returncode))
+        return result.stdout
+
+    def claim(self, offset: int) -> dict[str, Any]:
+        try:
+            claim = json.loads(self._call("claim", str(offset)))
+            updates = claim["updates"]
+            valid = isinstance(claim["offset"], int) and isinstance(updates, list) and all(
+                isinstance(item, dict) and isinstance(item.get("update_id"), int) for item in updates)
+        except (ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise RuntimeError("standby claim returned invalid JSON")
+        return claim
+
+    def ack(self, last_update_id: int) -> None:
+        self._call("ack", str(last_update_id))
+
+
 class Bridge:
     def __init__(self, api: Any, inbox: Any, state: State, owner_chat_id: int,
                  redactor: Redactor, logger: logging.Logger,
@@ -983,7 +1072,8 @@ class Bridge:
                  transcript_prefixes: Iterable[str] = (),
                  fleet: Optional[FleetAlerts] = None,
                  main_stall: Optional[MainStallCheck] = None,
-                 claude_probe: Optional[ClaudeProbeCheck] = None) -> None:
+                 claude_probe: Optional[ClaudeProbeCheck] = None,
+                 failover: Optional[Failover] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -993,6 +1083,7 @@ class Bridge:
         self.transcript_prefixes = list(transcript_prefixes)
         self.fleet = fleet
         self.main_stall, self.claude_probe = main_stall, claude_probe
+        self.failover = failover
 
     def send(self, text: str) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
@@ -1379,13 +1470,50 @@ class Bridge:
             self.state.data["receipt_cursor"] = str(receipts["reply_cursor"])
             self.state.save()
 
-    def once(self) -> None:
-        self._expire_choices()
+    def _take_over(self) -> None:
+        """Heartbeat the standby and handle what it queued while this primary was away."""
+        self.failover.last = self.failover.clock()
+        offset = int(self.state.data.get("offset", 0))
+        try:
+            claim = self.failover.claim(offset)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            # The primary keeps polling; a standby that is polling yields to it on HTTP 409.
+            self.log.warning("standby handoff failed: %s", self.redactor.redact(str(exc)))
+            return
+        # Adopt the standby's offset before anything else: getUpdates with it confirms
+        # every update the standby handled, so none of them reaches this primary again.
+        if claim["offset"] > offset:
+            self.state.data["offset"] = claim["offset"]
+            self.state.save()
+        try:
+            for update in claim["updates"]:
+                try:
+                    self.process_update(update)
+                except TelegramAPIError:
+                    # E.g. a callback too old to answer; its note was recorded first.
+                    self.log.warning("queued update id=%d not fully processed", update["update_id"])
+        except Exception:
+            self.failover.last = None  # Retry the queue before the next poll: keep the order.
+            raise
+        if claim["updates"]:
+            try:
+                self.failover.ack(max(update["update_id"] for update in claim["updates"]))
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                # The next claim repeats these updates; handled_update_ids skips them.
+                self.log.warning("standby ack failed: %s", self.redactor.redact(str(exc)))
+
+    def poll_updates(self) -> None:
         offset = int(self.state.data.get("offset", 0))
         for update in self.api.updates(offset):
             self.process_update(update)
             self.state.data["offset"] = int(update["update_id"]) + 1
             self.state.save()
+
+    def once(self) -> None:
+        self._expire_choices()
+        if self.failover and self.failover.due():
+            self._take_over()
+        self.poll_updates()
         if self.doorbell:
             self.doorbell.flush()
         self.check_replies()
@@ -1410,6 +1538,95 @@ class Bridge:
                 self.log.warning("bridge operation failed: %s", self.redactor.redact(str(exc)))
                 time.sleep(delay)
                 delay = min(delay * 2, 60.0)
+
+
+class Standby(Bridge):
+    """Always-on fallback poller that polls only while the primary's heartbeat is stale.
+
+    Owner messages starting with a configured prefix become notes in that prefix's
+    Firstmate home; everything else gets one away reply and is queued, unchanged, for
+    the primary to process when it next claims (see standby_claim).
+    """
+    def __init__(self, api: Any, state: State, owner_chat_id: int, redactor: Redactor,
+                 logger: logging.Logger, routes: dict[str, Any], stale_seconds: float,
+                 reply: str, clock: Callable[[], float] = time.time) -> None:
+        super().__init__(api, None, state, owner_chat_id, redactor, logger)
+        self.routes, self.stale_seconds, self.reply, self.clock = routes, stale_seconds, reply, clock
+        # A fresh start counts as a heartbeat, so a restart never polls straight away.
+        self.started, self.yield_until, self.active = clock(), 0.0, False
+
+    def primary_alive(self) -> bool:
+        try:
+            seen = (self.state.directory / HEARTBEAT_FILE).stat().st_mtime
+        except FileNotFoundError:
+            seen = 0.0
+        now = self.clock()
+        return now - max(seen, self.started) < self.stale_seconds or now < self.yield_until
+
+    def poll_updates(self) -> None:
+        # Never poll behind the primary: its last batch may still be unconfirmed.
+        primary = State._load(self.state.directory / HEARTBEAT_FILE, {}).get("offset", 0)
+        if isinstance(primary, int) and primary > int(self.state.data.get("offset", 0)):
+            self.state.data["offset"] = primary
+        super().poll_updates()
+
+    def process_update(self, update: dict[str, Any]) -> None:
+        update_id, callback = update.get("update_id"), update.get("callback_query")
+        message = (callback.get("message") if isinstance(callback, dict) else update.get("message"))
+        message = message if isinstance(message, dict) else {}
+        chat_id = (message.get("chat") or {}).get("id")
+        if not isinstance(update_id, int) or chat_id != self.owner_chat_id:
+            if isinstance(chat_id, int):
+                self.log.warning("ignored Telegram update from chat id=%d", chat_id)
+            return
+        handled = self.state.data.setdefault("handled_update_ids", [])
+        if update_id in handled:
+            return
+        text = message.get("text") or message.get("caption")
+        inbox = None if callback or not isinstance(text, str) else next(
+            (inbox for prefix, inbox in self.routes.items() if text.lstrip().startswith(prefix)), None)
+        if inbox:
+            self.inbox = inbox
+            super().process_update(update)  # Downloads, notes that home and sends its receipt.
+            return
+
+        def add(updates: list[Any]) -> None:
+            if all(item.get("update_id") != update_id for item in updates):
+                updates.append(update)
+        update_queue(self.state, add)
+        handled[:] = (handled + [update_id])[-MAX_HANDLED_UPDATES:]
+        self.state.save()
+        if isinstance(callback, dict):
+            if isinstance(callback.get("id"), str):
+                self.api.answer_callback(callback["id"], self.reply[:200])
+        else:
+            self.send(self.reply)
+
+    def run(self, interval: float) -> None:
+        while not self.stopping:
+            try:
+                if not self.primary_alive():
+                    with self.state._locked(self.state.directory / ACTIVE_LOCK):
+                        # A claim may have refreshed the heartbeat while we waited.
+                        if not self.primary_alive():
+                            if not self.active:
+                                self.log.info("primary heartbeat is stale; polling Telegram")
+                            self.active = True
+                            self.poll_updates()
+                elif self.active:
+                    self.log.info("primary is back; standing by")
+                    self.active = False
+            except TelegramAPIError as exc:
+                if exc.code == 409:
+                    # Another poller (the primary, unable to heartbeat) owns getUpdates.
+                    self.log.warning("another poller is active; standing by")
+                    self.yield_until = self.clock() + self.stale_seconds
+                else:
+                    self.log.warning("standby operation failed: %s", self.redactor.redact(str(exc)))
+            except (RuntimeError, OSError) as exc:
+                self.log.warning("standby operation failed: %s", self.redactor.redact(str(exc)))
+            if not self.stopping:
+                time.sleep(interval)
 
 
 def logger_for(redactor: Redactor) -> logging.Logger:
@@ -1465,12 +1682,38 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
         _positive_number(config["claude_probe_timeout_seconds"], "claude_probe_timeout_seconds"),
         state=state,
     ) if config["claude_probe"] else None
+    failover = Failover(
+        _command(config["failover_command"], "failover_command"),
+        _positive_number(config["failover_interval_seconds"], "failover_interval_seconds"),
+    ) if config["failover_command"] else None
     bridge = Bridge(TelegramAPI(token, base=config["api_base"]), inbox, state,
                     config["owner_chat_id"], redactor, logger, doorbell,
                     transcriber=lambda path: transcribe(path, whisper, model, language),
                     transcript_prefixes=config["transcript_prefixes"], fleet=fleet,
-                    main_stall=main_stall, claude_probe=claude_probe)
+                    main_stall=main_stall, claude_probe=claude_probe, failover=failover)
     return bridge, config
+
+
+def build_standby(args: argparse.Namespace) -> tuple[Standby, dict[str, Any]]:
+    config = load_config(args.config, args.state_dir / "config.json")
+    routes = config["standby_routes"]
+    if not isinstance(routes, dict) or not all(isinstance(prefix, str) and prefix.strip() and
+                                               isinstance(home, str) and home
+                                               for prefix, home in routes.items()):
+        raise RuntimeError("config standby_routes must map prefixes to Firstmate home paths")
+    inboxes = {}
+    for prefix, home in routes.items():
+        inboxes[prefix] = Inbox(Path(home).expanduser())
+        if not inboxes[prefix].command.is_file():
+            raise RuntimeError("standby_routes home has no bin/fm-inbox.sh: %s" % home)
+    state = State(args.state_dir)
+    token = read_token(str(config["keychain_service"]), args.config.parent / "runtime.env")
+    redactor = Redactor(_path(config["denylist_file"]), secrets=[token])
+    standby = Standby(TelegramAPI(token, base=config["api_base"]), state, config["owner_chat_id"],
+                      redactor, logger_for(redactor), inboxes,
+                      _positive_number(config["standby_stale_seconds"], "standby_stale_seconds"),
+                      str(config["standby_reply"]))
+    return standby, config
 
 
 SETUP_NEEDS_HUMAN = 3  # Exit code: a person has to act, then `setup` can simply be run again.
@@ -1806,10 +2049,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                        help="only store and verify the bot token")
     setup.add_argument("--wait", type=int, default=300,
                        help="seconds to wait for a Telegram message (default 300)")
+    standby = sub.add_parser("standby", help="fallback poller for a second, always-on machine")
+    standby.add_argument("action", choices=["run", "claim", "ack"],
+                         help="run: the fallback service; claim/ack: the primary's handoff")
+    standby.add_argument("value", nargs="?", type=int, default=0,
+                         help="claim: the primary's offset; ack: last update id taken over")
     args = parser.parse_args(argv)
     if args.command == "setup":
         return Setup(args).run()
-    bridge, config = build_bridge(args)
+    if args.command == "standby" and args.action != "run":
+        state = State(args.state_dir)
+        if args.action == "ack":
+            standby_ack(state, args.value)
+        else:
+            print(json.dumps(standby_claim(state, args.value), ensure_ascii=False))
+        return 0
+    bridge, config = build_standby(args) if args.command == "standby" else build_bridge(args)
     if args.command == "notify":
         text = sys.stdin.read() if args.text == "-" else args.text
         if args.choice:

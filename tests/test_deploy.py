@@ -23,6 +23,7 @@ esac""",
     "codesign": '[ -f "$FAKE/unsigned" ] && echo "designated => identifier x" || echo \'designated => cdhash H"00"\'',
     "herdr": 'case "$2" in run) echo 777 > "$FAKE/pollers" ;; esac',
     "sleep": ":",
+    "systemctl": ":",
     "fm-telegram-python": "exit 0",  # the dedicated runtime; it lives outside PATH
 }
 
@@ -60,6 +61,18 @@ class DeployTests(unittest.TestCase):
     def state(self, **files):
         for name, text in files.items():
             (self.fake / name).write_text(text)
+
+    def test_install_standby_renders_its_own_systemd_unit(self):
+        self.assertEqual(2, self.run_script("install.sh", "--standby").returncode)
+        self.assertEqual(2, self.run_script("install.sh", "--launchd", "--standby").returncode)
+        result = self.run_script("install.sh", "--version", "v1", "--systemd", "--standby",
+                                 FM_TELEGRAM_LABEL="", XDG_CONFIG_HOME=str(self.root / "cfg"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        label = "io.github.fm-telegram.fm-telegram-standby"
+        unit = (self.root / "cfg/systemd/user" / (label + ".service")).read_text()
+        self.assertIn("%s/current/fm_telegram.py standby run\n" % self.data, unit)
+        self.assertNotIn("@", unit.replace("%h", ""))
+        self.assertIn("--user enable --now %s.service" % label, self.calls("systemctl"))
 
     def test_install_python_must_be_an_absolute_executable(self):
         script = self.root / "not-executable"

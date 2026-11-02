@@ -15,6 +15,9 @@ Run the installer from a checked-out, reviewed revision. It installs immutable r
 
 # Linux: reconciles a systemd user unit.
 ./deploy/install.sh --systemd
+
+# Linux: the standby fallback poller instead (docs/standby-fallback.md).
+./deploy/install.sh --systemd --standby
 ```
 
 Override `FM_TELEGRAM_DATA_DIR`, `FM_TELEGRAM_LABEL`, `--data-dir`, or `--version` for an isolated test. The installer uses the checked-out Git revision when no version is supplied. It never kills a PID or copies into an unversioned live program path.
