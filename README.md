@@ -267,7 +267,7 @@ Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, clea
 
 ## Optional: standby fallback on a second machine
 
-When the machine running the bridge sleeps, a standby bridge on an always-on machine can answer for it: one away reply per message, prefixed messages (such as `불침번:`) delivered at once to another Firstmate home there, and everything else queued and handed back in order when the primary returns. The primary heartbeats the standby over SSH (`failover_command`), so the two never poll Telegram at the same time and the standby opens no port. See [docs/standby-fallback.md](docs/standby-fallback.md) for the handoff guarantees, configuration and deploy checklist.
+When the machine running the bridge sleeps, a standby bridge on an always-on machine can answer for it: one away reply per message, messages that call a secondmate by name (such as `미니야 …` or `/m …`, also while the primary is awake) delivered at once to a Firstmate home there, and everything else queued and handed back in order when the primary returns. The primary heartbeats the standby over SSH (`failover_command`), so the two never poll Telegram at the same time and the standby opens no port. See [docs/standby-fallback.md](docs/standby-fallback.md) for the handoff guarantees, configuration and deploy checklist.
 
 ## Optional: main and Claude health checks
 

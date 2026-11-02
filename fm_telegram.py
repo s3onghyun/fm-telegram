@@ -44,6 +44,7 @@ SEEN_REACTION = "👀"
 # ✅ is not in Telegram's ReactionTypeEmoji allowed list; 👌 is the closest allowed check.
 DONE_REACTION = "👌"
 CHOICE_TTL_SECONDS = 7 * 24 * 60 * 60
+RECEIPT = "Received. Note ID: %s"
 CONFIG_DEFAULTS: dict[str, Any] = {
     "owner_chat_id": None,
     "firstmate_home": None,
@@ -514,6 +515,9 @@ class TelegramAPI:
         return self.call("editMessageReplyMarkup", {
             "chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup,
         })
+
+    def set_commands(self, commands: list[dict[str, str]]) -> Any:
+        return self.call("setMyCommands", {"commands": commands})
 
     def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> Any:
         """React to a message without creating another captain-facing message."""
@@ -1029,6 +1033,142 @@ def standby_ack(state: State, last_update_id: int) -> None:
     update_queue(state, drop)
 
 
+@dataclass(frozen=True)
+class RouteHome:
+    """One Firstmate home on the standby; the first of a route's homes is its default."""
+    key: Optional[str]
+    inbox: Any = None  # Only the standby, which owns the home, has an Inbox.
+    tag: Optional[str] = None
+    keywords: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Route:
+    """A name the owner calls ("미니야 …", "/m …") to reach secondmate homes on the standby."""
+    name: str
+    calls: tuple[str, ...]
+    commands: tuple[str, ...]
+    label: str
+    emoji: str
+    receipt: str
+    homes: tuple[RouteHome, ...]
+
+    def strip(self, text: str) -> Optional[str]:
+        """Return text without a leading call of this route, or None when it is not called."""
+        start = text.lstrip()
+        for command in self.commands:
+            match = re.match(r"%s(?:@\w+)?(?:\s+|$)" % re.escape(command), start, re.IGNORECASE)
+            if match:
+                return start[match.end():]
+        for call in sorted(self.calls, key=len, reverse=True):
+            if start[:len(call)].casefold() != call.casefold():
+                continue
+            # Korean vocative 야/아, then a separator or the end: "미니멀" and "미니아폴리스" are not calls.
+            match = VOCATIVE.match(start[len(call):])
+            if match:
+                return start[len(call) + match.end():]
+        return None
+
+    def home_for(self, message: dict[str, Any]) -> RouteHome:
+        """Reply-to keeps the home that answered; otherwise a keyword picks it, else the default."""
+        reply = _reply_text(message)
+        if self.answered(reply):
+            first_line = reply.split("\n", 1)[0]
+            for home in self.homes[1:]:
+                if "(%s)" % home.tag in first_line:
+                    return home
+            return self.homes[0]
+        text = str(message.get("text") or message.get("caption") or "").casefold()
+        return next((home for home in self.homes[1:]
+                     if any(word.casefold() in text for word in home.keywords)), self.homes[0])
+
+    def answered(self, text: str) -> bool:
+        """True for a message this route sent: a labelled answer or its delivery receipt."""
+        return bool(text) and (text.startswith(self.label) or text.startswith(self.receipt))
+
+    def receipt_for(self, home: RouteHome) -> str:
+        return self.receipt + (" (%s)" % home.tag if home.tag else "")
+
+
+VOCATIVE = re.compile(r"(?:야|아)?(?:[\s,.:!?~]+|$)")
+BOT_COMMAND = re.compile(r"/[a-z0-9_]{1,32}")
+ROUTE_EMOJI = "👨‍💻"  # 🖥️ is not a Telegram reaction; 👨‍💻 is the closest allowed one.
+
+
+def _reply_text(message: dict[str, Any]) -> str:
+    reply = message.get("reply_to_message")
+    reply = reply if isinstance(reply, dict) else {}
+    text = reply.get("text") or reply.get("caption")
+    return text if isinstance(text, str) else ""
+
+
+def match_route(routes: dict[str, Route], message: dict[str, Any]) -> Optional[tuple[Route, dict[str, Any]]]:
+    """Find the route a message calls (or replies to) and the message with the call removed."""
+    field = "text" if isinstance(message.get("text"), str) else "caption"
+    value = message.get(field)
+    for route in routes.values():
+        rest = route.strip(value) if isinstance(value, str) else None
+        if rest is not None:
+            routed = dict(message)
+            if rest.strip():
+                routed[field] = rest
+            elif field == "caption":
+                routed.pop("caption")  # Keep a bare "미니야" text as it is: a note is never empty.
+            return route, routed
+    reply = _reply_text(message)
+    route = next((route for route in routes.values() if route.answered(reply)), None)
+    return (route, message) if route else None
+
+
+def _strings(value: Any, key: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise RuntimeError("config %s must be a list of non-empty strings" % key)
+    return tuple(value)
+
+
+def parse_routes(value: Any, local: bool) -> dict[str, Route]:
+    """Parse standby_routes. local=True (the standby) also requires each home's fm-inbox.sh."""
+    if not isinstance(value, dict):
+        raise RuntimeError("config standby_routes must map names to Firstmate homes")
+    routes = {}
+    for name, spec in value.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(spec, dict):
+            raise RuntimeError("config standby_routes must map names to Firstmate homes")
+        key = "standby_routes.%s" % name
+        homes_spec = spec.get("homes", {})
+        if not isinstance(homes_spec, dict):
+            raise RuntimeError("config %s.homes must map keys to homes" % key)
+        homes = []
+        for home_key, home_spec in [(None, spec), *homes_spec.items()]:
+            path = home_spec.get("home") if isinstance(home_spec, dict) else None
+            if not isinstance(path, str) or not path:
+                raise RuntimeError("config %s needs a home path" % key)
+            inbox = Inbox(Path(path).expanduser()) if local else None
+            if inbox and not inbox.command.is_file():
+                raise RuntimeError("standby_routes home has no bin/fm-inbox.sh: %s" % path)
+            homes.append(RouteHome(home_key, inbox, str(home_spec.get("tag") or home_key)
+                                   if home_key else None,
+                                   _strings(home_spec.get("keywords", []), key + ".keywords")
+                                   if home_key else ()))
+        commands = _strings(spec.get("commands", []), key + ".commands")
+        if not all(BOT_COMMAND.fullmatch(command) for command in commands):
+            raise RuntimeError("config %s.commands must look like /m (lowercase, at most 32)" % key)
+        routes[name] = Route(name, (name, *_strings(spec.get("aliases", []), key + ".aliases")),
+                             commands, str(spec.get("label") or "[%s]" % name),
+                             str(spec.get("emoji") or ROUTE_EMOJI),
+                             str(spec.get("receipt") or "→ %s에게 전달했어요" % name), tuple(homes))
+    return routes
+
+
+def standby_deliver(standby: "Standby", payload: Any) -> dict[str, Any]:
+    """Standby side of a named message the primary received: note the chosen home there."""
+    route = standby.routes.get(payload.get("route")) if isinstance(payload, dict) else None
+    update = payload.get("update") if route else None
+    if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+        raise RuntimeError("standby deliver needs a known route and an update")
+    return {"home": standby.deliver(route, update)}
+
+
 class Failover:
     """Primary side of the standby fallback: heartbeat the standby and take over its queue."""
     def __init__(self, command: list[str], interval: float,
@@ -1041,9 +1181,9 @@ class Failover:
     def due(self) -> bool:
         return self.last is None or self.clock() - self.last >= self.interval
 
-    def _call(self, *args: str) -> str:
-        result = self.runner([*self.command, "standby", *args], text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, timeout=120, check=False)
+    def _call(self, *args: str, body: Optional[str] = None) -> str:
+        result = self.runner([*self.command, "standby", *args], input=body, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
         if result.returncode != 0:
             raise RuntimeError("standby %s failed (exit %d)" % (args[0], result.returncode))
         return result.stdout
@@ -1063,6 +1203,16 @@ class Failover:
     def ack(self, last_update_id: int) -> None:
         self._call("ack", str(last_update_id))
 
+    def deliver(self, route: str, update: dict[str, Any]) -> Optional[str]:
+        """Have the standby note a named message in its home; returns the home key it chose."""
+        # ASCII JSON: a LaunchAgent's locale may not encode Korean on the way into ssh.
+        output = self._call("deliver", body=json.dumps({"route": route, "update": update}))
+        try:
+            home = json.loads(output).get("home")
+        except (ValueError, AttributeError):
+            home = None  # Delivered (exit 0); only the FYI copy loses the home key.
+        return home if isinstance(home, str) else None
+
 
 class Bridge:
     def __init__(self, api: Any, inbox: Any, state: State, owner_chat_id: int,
@@ -1073,7 +1223,8 @@ class Bridge:
                  fleet: Optional[FleetAlerts] = None,
                  main_stall: Optional[MainStallCheck] = None,
                  claude_probe: Optional[ClaudeProbeCheck] = None,
-                 failover: Optional[Failover] = None) -> None:
+                 failover: Optional[Failover] = None,
+                 routes: Optional[dict[str, Route]] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -1084,6 +1235,30 @@ class Bridge:
         self.fleet = fleet
         self.main_stall, self.claude_probe = main_stall, claude_probe
         self.failover = failover
+        self.routes = routes or {}
+
+    def labelled(self, sender: str, text: str) -> str:
+        """Prefix a relayed secondmate answer with its route label, e.g. "[미니] (인스타 담당) …"."""
+        name, _, key = sender.partition("/")
+        route = self.routes.get(name)
+        home = next((home for home in route.homes[1:] if home.key == key), None) if route and key \
+            else (route.homes[0] if route else None)
+        if not home:
+            raise RuntimeError("--from must name a standby_routes entry (NAME or NAME/HOME)")
+        return "%s %s%s" % (route.label, "(%s) " % home.tag if home.tag else "", text)
+
+    def register_commands(self) -> None:
+        """List the routes' short commands (and /status, /help) in Telegram's command menu."""
+        commands = [{"command": command[1:], "description": "%s에게 보내기" % route.name}
+                    for route in self.routes.values() for command in route.commands]
+        if not commands:
+            return
+        try:
+            self.api.set_commands(commands + [
+                {"command": "status", "description": "Firstmate inbox status"},
+                {"command": "help", "description": "What this bot accepts"}])
+        except (TelegramAPIError, RuntimeError) as exc:
+            self.log.warning("setMyCommands failed: %s", self.redactor.redact(str(exc)))
 
     def send(self, text: str) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
@@ -1282,6 +1457,12 @@ class Bridge:
             return
         if update_id in self.state.data.get("handled_update_ids", []):
             return  # A replayed update: no second download, transcription or receipt.
+        if isinstance(update.get("routed"), str):  # The standby delivered it while we were away.
+            self._fyi(update_id, update["routed"], update.get("routed_home"), message)
+            return
+        matched = match_route(self.routes, message) if self.failover and self.routes else None
+        if matched and self._route(update, *matched):
+            return
         text = message.get("text")
         if not isinstance(text, str):
             try:
@@ -1304,7 +1485,10 @@ class Bridge:
         if command == "/help":
             self.send("Send text, photos, voice, video or files (up to 20 MB) and each becomes a "
                       "Firstmate note. /status shows the inbox status. Keep secrets, logs and "
-                      "diffs out of Telegram; read them on the machine itself.")
+                      "diffs out of Telegram; read them on the machine itself." +
+                      "".join(" Start with %s야 or %s to send it to %s." % (
+                          route.name, route.commands[0] if route.commands else route.name, route.name)
+                          for route in self.routes.values()))
             return
         if command == "/status":
             self.send(self.inbox.status()[:3500] or "No status available.")
@@ -1433,15 +1617,41 @@ class Bridge:
                     and receipt.get("id") not in completed:  # Never downgrade 👌 back to 👀.
                 self._react_once(receipt.get("id"), "telegram_acknowledged_note_ids", SEEN_REACTION)
 
-    def _submit(self, update_id: int, text: str, receipt: str = "Received. Note ID: %s",
+    def _mark_handled(self, update_id: int) -> None:
+        handled = self.state.data.setdefault("handled_update_ids", [])
+        handled[:] = (handled + [update_id])[-MAX_HANDLED_UPDATES:]
+        self.state.save()
+
+    def _route(self, update: dict[str, Any], route: Route, routed: dict[str, Any]) -> bool:
+        """Hand a named message to the standby, which notes it and sends the receipt."""
+        try:
+            home = self.failover.deliver(route.name, {**update, "message": routed})
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            self.log.warning("delivery to %s failed: %s", route.name, self.redactor.redact(str(exc)))
+            self.send("⚠️ %s에게 전달하지 못해서 메인에 남길게요" % route.name)
+            return False  # The caller notes the original message here, call included.
+        self._fyi(update["update_id"], route.name, home, routed)
+        return True
+
+    def _fyi(self, update_id: int, name: str, home: Any, message: dict[str, Any]) -> None:
+        """Keep Firstmate informed of a routed message without ever answering it on Telegram."""
+        text = message.get("text") or message.get("caption")
+        if not isinstance(text, str) or not text.strip():
+            text = "(%s)" % self._describe(message)
+        target = name + ("/%s" % home if isinstance(home, str) else "")
+        # Not added to telegram_note_ids, so a reply to this note never reaches Telegram.
+        self.inbox.note("tg:%d" % update_id, "[FYI routed-to:%s] The owner sent this to %s on the "
+                        "standby machine, which already has it. Read-only copy: no reply "
+                        "needed.\n%s" % (target, name, text))
+        self._mark_handled(update_id)
+
+    def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
                 message: Optional[dict[str, Any]] = None) -> None:
         note = self.inbox.note("tg:%d" % update_id, text)
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
         note_id = note.id
-        handled = self.state.data.setdefault("handled_update_ids", [])
-        handled[:] = (handled + [update_id])[-MAX_HANDLED_UPDATES:]
-        self.state.save()
+        self._mark_handled(update_id)
         known = self.state.data.setdefault("telegram_note_ids", [])
         if note_id not in known:
             known.append(note_id)
@@ -1527,6 +1737,7 @@ class Bridge:
             self.claude_probe.poll(self.send)
 
     def run(self, interval: float) -> None:
+        self.register_commands()
         delay = 1.0
         while not self.stopping:
             try:
@@ -1543,15 +1754,17 @@ class Bridge:
 class Standby(Bridge):
     """Always-on fallback poller that polls only while the primary's heartbeat is stale.
 
-    Owner messages starting with a configured prefix become notes in that prefix's
-    Firstmate home; everything else gets one away reply and is queued, unchanged, for
-    the primary to process when it next claims (see standby_claim).
+    Owner messages that call a route ("미니야 …") become notes in that route's home here,
+    and an FYI copy is queued for the primary; everything else gets one away reply and
+    is queued, unchanged, for the primary to process when it next claims (see standby_claim).
     """
     def __init__(self, api: Any, state: State, owner_chat_id: int, redactor: Redactor,
-                 logger: logging.Logger, routes: dict[str, Any], stale_seconds: float,
+                 logger: logging.Logger, routes: dict[str, Route], stale_seconds: float,
                  reply: str, clock: Callable[[], float] = time.time) -> None:
-        super().__init__(api, None, state, owner_chat_id, redactor, logger)
-        self.routes, self.stale_seconds, self.reply, self.clock = routes, stale_seconds, reply, clock
+        super().__init__(api, None, state, owner_chat_id, redactor, logger, routes=routes)
+        self.stale_seconds, self.reply, self.clock = stale_seconds, reply, clock
+        self.route: Optional[Route] = None
+        self.route_home: Optional[RouteHome] = None
         # A fresh start counts as a heartbeat, so a restart never polls straight away.
         self.started, self.yield_until, self.active = clock(), 0.0, False
 
@@ -1582,25 +1795,46 @@ class Standby(Bridge):
         handled = self.state.data.setdefault("handled_update_ids", [])
         if update_id in handled:
             return
-        text = message.get("text") or message.get("caption")
-        inbox = None if callback or not isinstance(text, str) else next(
-            (inbox for prefix, inbox in self.routes.items() if text.lstrip().startswith(prefix)), None)
-        if inbox:
-            self.inbox = inbox
-            super().process_update(update)  # Downloads, notes that home and sends its receipt.
-            return
+        matched = None if callback else match_route(self.routes, message)
+        queued = update
+        if matched:  # Noted in its home here; the primary later gets only an FYI copy.
+            route, routed = matched
+            home = self.deliver(route, {**update, "message": routed})
+            queued = {"update_id": update_id, "message": routed, "routed": route.name,
+                      "routed_home": home}
 
         def add(updates: list[Any]) -> None:
             if all(item.get("update_id") != update_id for item in updates):
-                updates.append(update)
+                updates.append(queued)
         update_queue(self.state, add)
-        handled[:] = (handled + [update_id])[-MAX_HANDLED_UPDATES:]
-        self.state.save()
+        if matched:
+            return
+        self._mark_handled(update_id)
         if isinstance(callback, dict):
             if isinstance(callback.get("id"), str):
                 self.api.answer_callback(callback["id"], self.reply[:200])
         else:
             self.send(self.reply)
+
+    def deliver(self, route: Route, update: dict[str, Any]) -> Optional[str]:
+        """Note a routed message in the home it belongs to; return that home's key."""
+        home = route.home_for(update.get("message") or {})
+        self.inbox, self.route, self.route_home = home.inbox, route, home
+        Bridge.process_update(self, update)  # Downloads, notes that home, sends the route receipt.
+        return home.key
+
+    def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
+                message: Optional[dict[str, Any]] = None) -> None:
+        note = self.inbox.note("tg:%d" % update_id, text)
+        note_id = note if isinstance(note, str) else note.id  # str: an Inbox test double.
+        self._mark_handled(update_id)
+        message_id = (message or {}).get("message_id")
+        if isinstance(message_id, int):
+            try:
+                self.api.set_reaction(self.owner_chat_id, message_id, self.route.emoji)
+            except (TelegramAPIError, RuntimeError, OSError):
+                self.log.warning("failed to react to routed update id=%d", update_id)
+        self.send(self.route.receipt_for(self.route_home) if receipt == RECEIPT else receipt % note_id)
 
     def run(self, interval: float) -> None:
         while not self.stopping:
@@ -1686,31 +1920,26 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
         _command(config["failover_command"], "failover_command"),
         _positive_number(config["failover_interval_seconds"], "failover_interval_seconds"),
     ) if config["failover_command"] else None
+    routes = parse_routes(config["standby_routes"], local=False)
+    if routes and not failover:
+        raise RuntimeError("config standby_routes on the primary needs failover_command")
     bridge = Bridge(TelegramAPI(token, base=config["api_base"]), inbox, state,
                     config["owner_chat_id"], redactor, logger, doorbell,
                     transcriber=lambda path: transcribe(path, whisper, model, language),
                     transcript_prefixes=config["transcript_prefixes"], fleet=fleet,
-                    main_stall=main_stall, claude_probe=claude_probe, failover=failover)
+                    main_stall=main_stall, claude_probe=claude_probe, failover=failover,
+                    routes=routes)
     return bridge, config
 
 
 def build_standby(args: argparse.Namespace) -> tuple[Standby, dict[str, Any]]:
     config = load_config(args.config, args.state_dir / "config.json")
-    routes = config["standby_routes"]
-    if not isinstance(routes, dict) or not all(isinstance(prefix, str) and prefix.strip() and
-                                               isinstance(home, str) and home
-                                               for prefix, home in routes.items()):
-        raise RuntimeError("config standby_routes must map prefixes to Firstmate home paths")
-    inboxes = {}
-    for prefix, home in routes.items():
-        inboxes[prefix] = Inbox(Path(home).expanduser())
-        if not inboxes[prefix].command.is_file():
-            raise RuntimeError("standby_routes home has no bin/fm-inbox.sh: %s" % home)
+    routes = parse_routes(config["standby_routes"], local=True)
     state = State(args.state_dir)
     token = read_token(str(config["keychain_service"]), args.config.parent / "runtime.env")
     redactor = Redactor(_path(config["denylist_file"]), secrets=[token])
     standby = Standby(TelegramAPI(token, base=config["api_base"]), state, config["owner_chat_id"],
-                      redactor, logger_for(redactor), inboxes,
+                      redactor, logger_for(redactor), routes,
                       _positive_number(config["standby_stale_seconds"], "standby_stale_seconds"),
                       str(config["standby_reply"]))
     return standby, config
@@ -2037,6 +2266,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     notify.add_argument("text", help="notification text, or - to read stdin")
     notify.add_argument("--choice", action="append", default=[], metavar="QUESTION:OPTION=LABEL",
                         help="add an inline button; repeat for each option")
+    notify.add_argument("--from", dest="sender", metavar="NAME[/HOME]",
+                        help="relay a secondmate's answer under its standby_routes label")
     setup = sub.add_parser("setup", help="create or check the config, token, owner chat and "
                            "run mode; safe to run again")
     setup.add_argument("--firstmate-home", type=Path, help="Firstmate home with bin/fm-inbox.sh")
@@ -2050,13 +2281,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     setup.add_argument("--wait", type=int, default=300,
                        help="seconds to wait for a Telegram message (default 300)")
     standby = sub.add_parser("standby", help="fallback poller for a second, always-on machine")
-    standby.add_argument("action", choices=["run", "claim", "ack"],
-                         help="run: the fallback service; claim/ack: the primary's handoff")
+    standby.add_argument("action", choices=["run", "claim", "ack", "deliver"],
+                         help="run: the fallback service; claim/ack: the primary's handoff; "
+                         "deliver: note a named message (JSON on stdin) in its home here")
     standby.add_argument("value", nargs="?", type=int, default=0,
                          help="claim: the primary's offset; ack: last update id taken over")
     args = parser.parse_args(argv)
     if args.command == "setup":
         return Setup(args).run()
+    if args.command == "standby" and args.action == "deliver":
+        standby_bridge, _config = build_standby(args)
+        print(json.dumps(standby_deliver(standby_bridge, json.load(sys.stdin))))
+        return 0
     if args.command == "standby" and args.action != "run":
         state = State(args.state_dir)
         if args.action == "ack":
@@ -2067,6 +2303,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     bridge, config = build_standby(args) if args.command == "standby" else build_bridge(args)
     if args.command == "notify":
         text = sys.stdin.read() if args.text == "-" else args.text
+        if args.sender:
+            text = bridge.labelled(args.sender, text)
         if args.choice:
             bridge.send_choices(text, parse_choices(args.choice))
         else:
