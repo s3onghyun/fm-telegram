@@ -1,9 +1,11 @@
 """Bridge + real HTTP client against the fake Telegram API and a scripted fm-inbox.sh."""
 import argparse
+import io
 import json
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,6 +99,34 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual("HTML", last["parse_mode"])
         self.assertNotIn("not for Telegram", json.dumps(self.server.sent))
         self.assertEqual("0002", self.bridge.state.data["receipt_cursor"])
+
+    def test_standby_deliver_notes_the_chosen_home_and_sends_the_receipt(self):
+        root = self.home.parent
+        homes = {}
+        for name in ("personal", "insta"):
+            homes[name] = root / name
+            (homes[name] / "bin").mkdir(parents=True)
+            (homes[name] / "bin/fm-inbox.sh").write_text(FAKE_INBOX)
+            (homes[name] / "bin/fm-inbox.sh").chmod(0o700)
+        config = root / "standby.json"
+        config.write_text(json.dumps({"owner_chat_id": OWNER, "api_base": self.server.base,
+                                      "standby_routes": {"미니": {"home": str(homes["personal"]), "homes": {
+                                          "insta": {"home": str(homes["insta"]), "tag": "인스타 담당",
+                                                    "keywords": ["릴스"]}}}}}))
+        config.chmod(0o600)
+        payload = {"route": "미니", "update": {"update_id": 7, "message": {
+            "message_id": 7, "chat": {"id": OWNER}, "text": "릴스 기획"}}}
+        out = io.StringIO()
+        with patch.dict(fm.os.environ, {fm.TOKEN_ENV: TOKEN}), \
+                patch.object(fm.sys, "stdin", io.StringIO(json.dumps(payload, ensure_ascii=False))), \
+                redirect_stdout(out):
+            code = fm.main(["--config", str(config), "--state-dir", str(root / "standby-state"),
+                            "standby", "deliver"])
+        self.assertEqual((0, {"home": "insta"}), (code, json.loads(out.getvalue())))
+        self.assertEqual("릴스 기획", json.loads((homes["insta"] / "notes.json").read_text())["tg:7"]["body"])
+        self.assertFalse((homes["personal"] / "notes.json").exists())
+        # The fake API rejects setMessageReaction: the receipt line is still sent.
+        self.assertEqual(["→ 미니에게 전달했어요 (인스타 담당)"], [row["text"] for row in self.server.sent])
 
     def test_html_rejected_by_telegram_is_resent_as_plain_text(self):
         self.bridge.send("**REJECT-HTML** result")
