@@ -199,6 +199,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `claude_probe_command` | `["claude", "auth", "status"]` | Command array for the no-model probe. |
 | `claude_auth_status_command` | `["claude", "auth", "status"]` | Command array checked after a failed probe for a logged-out state. |
 | `oss_watch` | — | Settings for the optional GitHub watcher (below). |
+| `failover_command`, `failover_interval_seconds`, `standby_*` | off | Standby fallback on a second machine; see [docs/standby-fallback.md](docs/standby-fallback.md). |
 
 | Environment variable | Meaning |
 |----------------------|---------|
@@ -263,6 +264,10 @@ Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, clea
 - **One notice per PR.** A PR URL is sent once. A worker's `done: PR <url>` line usually arrives first, so the later `task.pr_ready` for the same URL is skipped, and so is a re-registration. While `fleet_alerts` is on, `notify` also records the PR URLs in its text: if Firstmate tells you about a PR first, the ledger alert for it is skipped.
 - **Possible double notices.** Other events have no shared key. If Firstmate also sends a `notify` for a blocker, a decision or a PR it learned about after the alert, you get both. The ledger is at-least-once, so a rare repeated record can also repeat an alert.
 - **Trust.** The ledger copies status text verbatim from Firstmate's `state/`. Workers write those lines, and the alert is only as private as they are.
+
+## Optional: standby fallback on a second machine
+
+When the machine running the bridge sleeps, a standby bridge on an always-on machine can answer for it: one away reply per message, prefixed messages (such as `불침번:`) delivered at once to another Firstmate home there, and everything else queued and handed back in order when the primary returns. The primary heartbeats the standby over SSH (`failover_command`), so the two never poll Telegram at the same time and the standby opens no port. See [docs/standby-fallback.md](docs/standby-fallback.md) for the handoff guarantees, configuration and deploy checklist.
 
 ## Optional: main and Claude health checks
 
