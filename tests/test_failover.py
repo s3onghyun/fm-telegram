@@ -125,8 +125,10 @@ class FailoverTests(Fixture):
         self.assertEqual({"routed": "미니", "routed_home": None},
                          {key: self.queued()[1][key] for key in ("routed", "routed_home")})
         self.assertEqual([("tg:3", "오늘 진도")], self.routed.requests)
-        self.assertEqual([(OWNER, "맥이 자고 있어요 💤"), (OWNER, "🖥️ → 미니에게 전달했어요")],
+        self.assertEqual([(OWNER, "맥이 자고 있어요 💤"),
+                          (OWNER, "🖥️ 미니에게 전달: “오늘 진도” (개인 OSS 담당)")],
                          self.server.sent)  # One reply per owner message, none to the stranger.
+        self.assertEqual([None, 3], self.server.reply_to_message_ids)
         self.assertEqual([(OWNER, 3, "👨‍💻")], self.server.reactions)
         self.assertEqual([("cb-1", "맥이 자고 있어요 💤")], self.server.callback_answers)
         self.assertEqual(5, self.standby.state.data["offset"])
@@ -284,7 +286,9 @@ class NameCallTests(Fixture):
         route = self.routes["미니"]
         for replied, key in [("[미니] 오늘 할 일이에요", None), ("[미니] (인스타 담당) 초안이에요", "insta"),
                              ("🖥️ → 미니에게 전달했어요 (인스타 담당)", "insta"),
-                             ("🖥️ → 미니에게 전달했어요", None)]:
+                             ("🖥️ → 미니에게 전달했어요", None),
+                             ("🖥️ 미니에게 전달: “릴스 기획 세 개” (인스타 담당)", "insta"),
+                             ("🖥️ 미니에게 전달: “장보기” (개인 OSS 담당)", None)]:
             message = reply_to(1, "좋아 진행해", replied)["message"]
             matched_route, routed = fm.match_route(self.routes, message)
             self.assertEqual(("좋아 진행해", key), (routed["text"], route.home_for(routed).key), replied)
@@ -303,7 +307,8 @@ class NameCallTests(Fixture):
         self.assertEqual([], self.routed.requests)
         self.assertEqual(["ssh", "minipc", "fm_telegram.py", "standby", "deliver"], self.link.calls[-1])
         # One receipt, from the standby: 👨‍💻 plus the delivery line, never "Received. Note ID".
-        self.assertEqual([(OWNER, "🖥️ → 미니에게 전달했어요 (인스타 담당)")], self.server.sent)
+        self.assertEqual([(OWNER, "🖥️ 미니에게 전달: “릴스 기획 세 개” (인스타 담당)")], self.server.sent)
+        self.assertEqual([1], self.server.reply_to_message_ids)
         self.assertEqual([(OWNER, 1, "👨‍💻")], self.server.reactions)
         [(request_id, body)] = self.main_inbox.requests
         self.assertEqual("tg:1", request_id)
@@ -327,7 +332,15 @@ class NameCallTests(Fixture):
     def test_reply_to_mini_routes_on_the_primary_too(self):
         self.primary.process_update(reply_to(2, "이걸로 해줘", "[미니] (인스타 담당) 초안 두 개"))
         self.assertEqual([("tg:2", "이걸로 해줘")], self.insta.requests)
-        self.assertEqual([(OWNER, "🖥️ → 미니에게 전달했어요 (인스타 담당)")], self.server.sent)
+        self.assertEqual([(OWNER, "🖥️ 미니에게 전달: “이걸로 해줘” (인스타 담당)")], self.server.sent)
+        self.assertEqual([2], self.server.reply_to_message_ids)
+
+    def test_routed_receipt_quotes_a_single_line_and_ellipsizes(self):
+        text = "미니야 " + "불침번 아이콘 바꿔줘 " * 6
+        self.primary.process_update(update(8, OWNER, text))
+        self.assertEqual("🖥️ 미니에게 전달: “불침번 아이콘 바꿔줘 불침번 아이콘 바꿔줘 불침번 아이콘 바꿔줘 불침번 아이콘 바꿔줘 불침번 아이콘 바꿔줘…” (개인 OSS 담당)",
+                         self.server.sent[-1][1])
+        self.assertEqual(8, self.server.reply_to_message_ids[-1])
 
     def test_unnamed_text_still_goes_to_main(self):
         self.primary.process_update(update(3, OWNER, "미니멀하게 정리해줘"))

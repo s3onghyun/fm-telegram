@@ -24,6 +24,7 @@ class FakeTelegram:
         self.callback_answers = []
         self.markup_edits = []
         self.reply_markups = []
+        self.reply_to_message_ids = []
         self.reactions = []
 
     def get_file(self, file_id, limit):
@@ -37,10 +38,11 @@ class FakeTelegram:
         self.offsets.append(offset)
         return list(self.pending_updates)
 
-    def send(self, chat_id, text, parse_mode=None, reply_markup=None):
+    def send(self, chat_id, text, parse_mode=None, reply_markup=None, reply_to_message_id=None):
         self.sent.append((chat_id, text))
         self.parse_modes.append(parse_mode)
         self.reply_markups.append(reply_markup)
+        self.reply_to_message_ids.append(reply_to_message_id)
         return {"message_id": len(self.sent), "reply_markup": reply_markup}
 
     def answer_callback(self, callback_id, text=None):

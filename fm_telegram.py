@@ -495,13 +495,16 @@ class TelegramAPI:
         return path, data
 
     def send(self, chat_id: int, text: str, parse_mode: Optional[str] = None,
-             reply_markup: Optional[dict[str, Any]] = None) -> Any:
+             reply_markup: Optional[dict[str, Any]] = None,
+             reply_to_message_id: Optional[int] = None) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text,
                                    "disable_web_page_preview": True}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
         return self.call("sendMessage", payload)
 
     def answer_callback(self, callback_id: str, text: Optional[str] = None) -> Any:
@@ -1084,10 +1087,23 @@ class Route:
 
     def answered(self, text: str) -> bool:
         """True for a message this route sent: a labelled answer or its delivery receipt."""
-        return bool(text) and (text.startswith(self.label) or text.startswith(self.receipt))
+        return bool(text) and (text.startswith(self.label) or text.startswith(self.receipt)
+                               or text.startswith(self._receipt_prefix()))
 
-    def receipt_for(self, home: RouteHome) -> str:
-        return self.receipt + (" (%s)" % home.tag if home.tag else "")
+    def _receipt_prefix(self) -> str:
+        """Normalize the legacy receipt wording without breaking existing route config."""
+        legacy = "🖥️ → %s에게 전달했어요" % self.name
+        return "🖥️ %s에게 전달" % self.name if self.receipt == legacy else self.receipt
+
+    def receipt_for(self, home: RouteHome, message: dict[str, Any]) -> str:
+        """Return a compact, reply-safe receipt for a routed Telegram message."""
+        prefix = self._receipt_prefix()
+        text = message.get("text") or message.get("caption") or "(%s)" % self.name
+        quote = " ".join(str(text).split())
+        if len(quote) > 60:
+            quote = quote[:60].rstrip() + "…"
+        target = home.tag or "개인 OSS 담당"
+        return "%s: “%s” (%s)" % (prefix, quote, target)
 
 
 VOCATIVE = re.compile(r"(?:야|아)?(?:[\s,.:!?~]+|$)")
@@ -1260,7 +1276,7 @@ class Bridge:
         except (TelegramAPIError, RuntimeError) as exc:
             self.log.warning("setMyCommands failed: %s", self.redactor.redact(str(exc)))
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, reply_to_message_id: Optional[int] = None) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
             text = text[:MAX_OUTBOUND_CHARS] + "\n… (truncated)"
         redacted = self.redactor.redact(text)
@@ -1273,11 +1289,13 @@ class Bridge:
             remaining = 0.05 - (time.monotonic() - self._last_send)
             if remaining > 0:
                 time.sleep(remaining)
+            reply = {"reply_to_message_id": reply_to_message_id} \
+                if reply_to_message_id is not None else {}
             try:
-                self.api.send(self.owner_chat_id, part, parse_mode="HTML")
+                self.api.send(self.owner_chat_id, part, parse_mode="HTML", **reply)
             except TelegramAPIError:
                 # A malformed entity must not swallow a captain-facing result.
-                self.api.send(self.owner_chat_id, _plain_html(part))
+                self.api.send(self.owner_chat_id, _plain_html(part), **reply)
             self._last_send = time.monotonic()
 
     def _expire_choices(self) -> bool:
@@ -1834,7 +1852,9 @@ class Standby(Bridge):
                 self.api.set_reaction(self.owner_chat_id, message_id, self.route.emoji)
             except (TelegramAPIError, RuntimeError, OSError):
                 self.log.warning("failed to react to routed update id=%d", update_id)
-        self.send(self.route.receipt_for(self.route_home) if receipt == RECEIPT else receipt % note_id)
+        delivered = self.route.receipt_for(self.route_home, message or {}) \
+            if receipt == RECEIPT else receipt % note_id
+        self.send(delivered, reply_to_message_id=message_id if isinstance(message_id, int) else None)
 
     def run(self, interval: float) -> None:
         while not self.stopping:

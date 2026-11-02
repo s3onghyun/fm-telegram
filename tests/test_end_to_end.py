@@ -126,7 +126,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual("릴스 기획", json.loads((homes["insta"] / "notes.json").read_text())["tg:7"]["body"])
         self.assertFalse((homes["personal"] / "notes.json").exists())
         # The fake API rejects setMessageReaction: the receipt line is still sent.
-        self.assertEqual(["→ 미니에게 전달했어요 (인스타 담당)"], [row["text"] for row in self.server.sent])
+        self.assertEqual(["→ 미니에게 전달했어요: “릴스 기획” (인스타 담당)"],
+                         [row["text"] for row in self.server.sent])
+        self.assertEqual([7], [row["reply_to_message_id"] for row in self.server.sent])
 
     def test_html_rejected_by_telegram_is_resent_as_plain_text(self):
         self.bridge.send("**REJECT-HTML** result")
