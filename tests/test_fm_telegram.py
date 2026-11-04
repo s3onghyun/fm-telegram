@@ -167,6 +167,42 @@ class BridgeTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_deck_commands_reply_with_fm_deck_text(self):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append((cmd, kwargs["timeout"]))
+            return subprocess.CompletedProcess(cmd, 0, stdout="진행 중 1건\n• 회사 일 1건\n", stderr="")
+        self.bridge.deck = fm.Deck(["fm-deck"], 5, runner=runner)
+        self.bridge.process_update(update(1, OWNER, "/progress"))
+        self.bridge.process_update(update(2, OWNER, "/todo@my_bot"))
+        self.assertEqual([(["fm-deck", "telegram", "progress"], 5), (["fm-deck", "telegram", "todo"], 5)], calls)
+        self.assertEqual(2, len(self.api.sent))
+        self.assertIn("진행 중 1건", self.api.sent[0][1])
+        self.assertEqual([], self.inbox.requests)
+
+    def test_deck_failure_is_reported_not_turned_into_a_note(self):
+        def slow(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        self.bridge.deck = fm.Deck(["fm-deck"], 3, runner=slow)
+        self.bridge.process_update(update(1, OWNER, "/progress"))
+        self.assertIn("did not answer within 3 s", self.api.sent[0][1])
+        self.bridge.deck = fm.Deck(["fm-deck"], 3, runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 2, "", "boom"))
+        self.bridge.process_update(update(2, OWNER, "/todo"))
+        self.assertIn("failed (exit 2)", self.api.sent[1][1])
+        self.assertNotIn("boom", self.api.sent[1][1])
+        self.assertEqual([], self.inbox.requests)
+
+    def test_deck_commands_are_notes_when_fm_deck_is_not_configured(self):
+        self.bridge.process_update(update(1, OWNER, "/progress"))
+        self.assertEqual(1, len(self.inbox.requests))
+
+    def test_deck_text_is_redacted_on_the_way_out(self):
+        self.bridge.redactor = fm.Redactor(secrets=["Acme"])
+        self.bridge.deck = fm.Deck(["fm-deck"], 5, runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "• Acme thing", ""))
+        self.bridge.process_update(update(1, OWNER, "/todo"))
+        self.assertNotIn("Acme", self.api.sent[0][1])
+
     def test_allowlist_ignores_unknown_chat(self):
         self.bridge.process_update(update(1, 123, "do work"))
         self.assertEqual([], self.inbox.requests)

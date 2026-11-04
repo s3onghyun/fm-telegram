@@ -200,6 +200,8 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `claude_auth_status_command` | `["claude", "auth", "status"]` | Command array checked after a failed probe for a logged-out state. |
 | `oss_watch` | — | Settings for the optional GitHub watcher (below). |
 | `failover_command`, `failover_interval_seconds`, `standby_*` | off | Standby fallback on a second machine; see [docs/standby-fallback.md](docs/standby-fallback.md). |
+| `deck_command` | `null` | Command array for [fm-deck](https://github.com/s3onghyun/fm-deck), e.g. `["~/.local/bin/fm-deck"]`. Turns on `/progress` and `/todo` (below). |
+| `deck_timeout_seconds` | `20` | Maximum time for one fm-deck answer. |
 
 | Environment variable | Meaning |
 |----------------------|---------|
@@ -264,6 +266,12 @@ Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, clea
 - **One notice per PR.** A PR URL is sent once. A worker's `done: PR <url>` line usually arrives first, so the later `task.pr_ready` for the same URL is skipped, and so is a re-registration. While `fleet_alerts` is on, `notify` also records the PR URLs in its text: if Firstmate tells you about a PR first, the ledger alert for it is skipped.
 - **Possible double notices.** Other events have no shared key. If Firstmate also sends a `notify` for a blocker, a decision or a PR it learned about after the alert, you get both. The ledger is at-least-once, so a rare repeated record can also repeat an alert.
 - **Trust.** The ledger copies status text verbatim from Firstmate's `state/`. Workers write those lines, and the alert is only as private as they are.
+
+## Optional: /progress and /todo from fm-deck
+
+With `deck_command` set, `/progress` replies with the work under way (elapsed time, last news, what it waits on) and `/todo` with what waits on you (decisions, then mail and GitHub to answer). The bridge runs `<deck_command> telegram progress|todo` and sends its output; it never reads fm-deck's store itself. fm-deck applies its own privacy policy before the text reaches the bridge (company items as counts plus colleague names, career items as counts, its deny list), and the bridge's redactor runs on top. Without `deck_command` the two commands are ordinary notes, as before. Both commands appear in Telegram's command menu when fm-deck is configured.
+
+A morning or evening digest needs no bridge change: `fm-deck telegram digest | python3 ~/.local/share/fm-telegram/fm_telegram.py notify -` from a LaunchAgent or cron entry.
 
 ## Optional: standby fallback on a second machine
 

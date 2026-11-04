@@ -72,6 +72,8 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "standby_stale_seconds": 180,
     "standby_reply": "맥이 자고 있어요 💤 깨면 처리할게요",
     "standby_routes": {},
+    "deck_command": None,
+    "deck_timeout_seconds": 20,
 }
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
@@ -1230,6 +1232,29 @@ class Failover:
         return home if isinstance(home, str) else None
 
 
+DECK_COMMANDS = {"/progress": "progress", "/todo": "todo"}
+
+
+class Deck:
+    """Read-only text from fm-deck for /progress and /todo (fm-deck applies its own privacy policy)."""
+    def __init__(self, command: list[str], timeout: float,
+                 runner: Callable[..., Any] = subprocess.run) -> None:
+        self.command = [os.path.expanduser(command[0])] + command[1:]
+        self.timeout, self.runner = timeout, runner
+
+    def text(self, what: str) -> str:
+        try:
+            result = self.runner(self.command + ["telegram", what], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            return "fm-deck did not answer within %d s." % self.timeout
+        except OSError as exc:
+            return "fm-deck could not start (%s)." % exc.strerror
+        if result.returncode != 0:
+            return "fm-deck failed (exit %d)." % result.returncode
+        return result.stdout.strip() or "fm-deck had nothing to show."
+
+
 class Bridge:
     def __init__(self, api: Any, inbox: Any, state: State, owner_chat_id: int,
                  redactor: Redactor, logger: logging.Logger,
@@ -1240,7 +1265,8 @@ class Bridge:
                  main_stall: Optional[MainStallCheck] = None,
                  claude_probe: Optional[ClaudeProbeCheck] = None,
                  failover: Optional[Failover] = None,
-                 routes: Optional[dict[str, Route]] = None) -> None:
+                 routes: Optional[dict[str, Route]] = None,
+                 deck: Optional[Deck] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -1252,6 +1278,7 @@ class Bridge:
         self.main_stall, self.claude_probe = main_stall, claude_probe
         self.failover = failover
         self.routes = routes or {}
+        self.deck = deck
 
     def labelled(self, sender: str, text: str) -> str:
         """Prefix a relayed secondmate answer with its route label, e.g. "[미니] (인스타 담당) …"."""
@@ -1267,6 +1294,9 @@ class Bridge:
         """List the routes' short commands (and /status, /help) in Telegram's command menu."""
         commands = [{"command": command[1:], "description": "%s에게 보내기" % route.name}
                     for route in self.routes.values() for command in route.commands]
+        if self.deck:
+            commands += [{"command": "progress", "description": "진행 중인 일"},
+                         {"command": "todo", "description": "내가 정할 것·답할 것"}]
         if not commands:
             return
         try:
@@ -1502,7 +1532,9 @@ class Bridge:
         command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
         if command == "/help":
             self.send("Send text, photos, voice, video or files (up to 20 MB) and each becomes a "
-                      "Firstmate note. /status shows the inbox status. Keep secrets, logs and "
+                      "Firstmate note. /status shows the inbox status." +
+                      (" /progress shows work under way and /todo what waits on you." if self.deck else "") +
+                      " Keep secrets, logs and "
                       "diffs out of Telegram; read them on the machine itself." +
                       "".join(" Start with %s야 or %s to send it to %s." % (
                           route.name, route.commands[0] if route.commands else route.name, route.name)
@@ -1510,6 +1542,9 @@ class Bridge:
             return
         if command == "/status":
             self.send(self.inbox.status()[:3500] or "No status available.")
+            return
+        if command in DECK_COMMANDS and self.deck:
+            self.send(self.deck.text(DECK_COMMANDS[command]))
             return
         self._submit(update_id, text, message=message)
 
@@ -1940,6 +1975,9 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
         _command(config["failover_command"], "failover_command"),
         _positive_number(config["failover_interval_seconds"], "failover_interval_seconds"),
     ) if config["failover_command"] else None
+    deck = Deck(_command(config["deck_command"], "deck_command"),
+                _positive_number(config["deck_timeout_seconds"], "deck_timeout_seconds")) \
+        if config["deck_command"] else None
     routes = parse_routes(config["standby_routes"], local=False)
     if routes and not failover:
         raise RuntimeError("config standby_routes on the primary needs failover_command")
@@ -1948,7 +1986,7 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
                     transcriber=lambda path: transcribe(path, whisper, model, language),
                     transcript_prefixes=config["transcript_prefixes"], fleet=fleet,
                     main_stall=main_stall, claude_probe=claude_probe, failover=failover,
-                    routes=routes)
+                    routes=routes, deck=deck)
     return bridge, config
 
 
