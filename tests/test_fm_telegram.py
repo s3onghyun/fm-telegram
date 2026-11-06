@@ -883,6 +883,30 @@ class FleetAlertTests(unittest.TestCase):
         self.assertNotIn(token, alert)
         self.assertLess(len(alert), fm.MAX_ALERT_TEXT + 100)
 
+    def test_large_poll_sends_one_summary(self):
+        self.poll()
+        self.append(*(status_line("blocked", " replay %d" % number, task="remote-worker")
+                      for number in range(590)))
+        alerts = self.poll()
+        self.assertEqual(1, len(alerts))
+        self.assertIn("590 fleet alerts", alerts[0])
+        self.assertIn("remote-worker", alerts[0])
+        self.assertIn("blocked", alerts[0])
+
+    def test_replayed_alerts_are_skipped(self):
+        self.poll()
+        lines = [status_line("blocked", " replay %d" % number, task="remote-worker")
+                 for number in range(590)]
+        self.append(*lines)
+        self.assertEqual(1, len(self.poll()))
+        self.append(*lines)
+        self.assertEqual([], self.poll())
+
+    def test_single_alert_remains_unchanged(self):
+        self.poll()
+        self.append(status_line("blocked", " retry me"))
+        self.assertEqual(["⛔ Blocked · fix-login\nretry me"], self.poll())
+
     def test_failed_send_keeps_the_cursor_so_the_alert_is_retried(self):
         self.poll()
         self.append(status_line("blocked", " retry me"))
