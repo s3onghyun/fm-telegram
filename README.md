@@ -191,6 +191,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `transcript_prefixes` | `[]` | Words whose spoken form "word, …" is rewritten to "word: …", so a dictated `todo: buy milk` matches a typed one. |
 | `fleet_alerts` | `false` | Send alerts from Firstmate's fleet ledger (below). |
 | `fleet_alert_labels` | `{}` | Replace alert labels, keyed `pr_ready`, `needs-decision`, `blocked`, `failed`, `done`. |
+| `fleet_alert_burst_threshold` | `5` | More alerts than this in one ledger poll are sent as one summary. |
 | `main_stall_alerts` | `false` | Alert when a pending captain note exceeds the threshold or the Firstmate watcher is reported down. |
 | `main_stall_threshold_seconds` | `600` | Pending-note age that triggers the main-stall alert. |
 | `claude_probe` | `false` | Run the bounded Claude login/response probe below. |
@@ -262,7 +263,7 @@ Without this, news about Firstmate's tasks reaches your phone only when the Firs
 
 Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, cleanups and unknown events are skipped. Status text is cut to 600 characters, then redacted and sent like any other message. To change the wording, set `fleet_alert_labels`, for example `{"blocked": "⛔ 막힘"}`.
 
-- **No history flood, no repeats.** On the first poll after you enable it, the bridge starts at the end of the ledger. After that it saves a byte offset in `state.json` after each record, so a restart continues where it stopped. If the ledger is truncated, it is read again from its start. A partial last line waits for its newline.
+- **No history flood, no repeats.** On the first poll after you enable it, the bridge starts at the end of the ledger. After that it saves a byte offset in `state.json` after each record, so a restart continues where it stopped. If one poll contains more than `fleet_alert_burst_threshold` alerts, it sends one per-task/state summary instead. Recently sent alerts are also remembered (up to 2,000), so a replayed ledger line is skipped. If the ledger is truncated, it is read again from its start. A partial last line waits for its newline.
 - **One notice per PR.** A PR URL is sent once. A worker's `done: PR <url>` line usually arrives first, so the later `task.pr_ready` for the same URL is skipped, and so is a re-registration. While `fleet_alerts` is on, `notify` also records the PR URLs in its text: if Firstmate tells you about a PR first, the ledger alert for it is skipped.
 - **Possible double notices.** Other events have no shared key. If Firstmate also sends a `notify` for a blocker, a decision or a PR it learned about after the alert, you get both. The ledger is at-least-once, so a rare repeated record can also repeat an alert.
 - **Trust.** The ledger copies status text verbatim from Firstmate's `state/`. Workers write those lines, and the alert is only as private as they are.

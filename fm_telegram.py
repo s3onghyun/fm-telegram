@@ -6,6 +6,7 @@ import argparse
 import copy
 import fcntl
 import getpass
+import hashlib
 import html
 import json
 import logging
@@ -60,6 +61,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "transcript_prefixes": [],
     "fleet_alerts": False,
     "fleet_alert_labels": {},
+    "fleet_alert_burst_threshold": 5,
     "main_stall_alerts": False,
     "main_stall_threshold_seconds": 600,
     "claude_probe": False,
@@ -917,12 +919,17 @@ class Doorbell:
 
 class FleetAlerts:
     """Follow Firstmate's fleet ledger and turn captain-relevant records into alerts."""
-    def __init__(self, ledger: Path, state: State, labels: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, ledger: Path, state: State, labels: Optional[dict[str, str]] = None,
+                 burst_threshold: int = 5) -> None:
         self.ledger, self.state = ledger, state
         self.labels = {**FLEET_LABELS, **(labels or {})}
+        self.burst_threshold = burst_threshold if isinstance(burst_threshold, int) \
+            and not isinstance(burst_threshold, bool) and burst_threshold > 0 else 5
         # PR URLs already told to the owner, by an alert or by `notify`; appended by both processes.
         # shortcut: never pruned (one short line per PR), trim by hand if it ever matters.
         self.sent_path = state.directory / "sent-prs.txt"
+        self.sent_alerts_path = state.directory / "sent-alerts.json"
+        self.sent_alerts_lock_path = state.directory / "sent-alerts.lock"
 
     def sent(self) -> set[str]:
         try:
@@ -959,6 +966,88 @@ class FleetAlerts:
             return None, []
         return "%s · %s\n%s" % (self.labels[key], task, body), urls
 
+    @staticmethod
+    def _alert_key(record: dict[str, Any]) -> Optional[str]:
+        if record.get("event") == "task.pr_ready":
+            return "pr_ready"
+        state = record.get("state")
+        return state if isinstance(state, str) and state in FLEET_LABELS else None
+
+    @staticmethod
+    def _normalized_body(record: dict[str, Any]) -> str:
+        body = record.get("pr") if record.get("event") == "task.pr_ready" else record.get("text")
+        return " ".join(body.split()) if isinstance(body, str) else ""
+
+    def _alert_id(self, record: dict[str, Any]) -> Optional[str]:
+        task, state = record.get("task"), self._alert_key(record)
+        if not isinstance(task, str) or not state:
+            return None
+        key = record.get("key")
+        if key is not None:
+            discriminator = "key:" + str(key)
+        else:
+            discriminator = "text:" + hashlib.sha256(
+                self._normalized_body(record).encode("utf-8")).hexdigest()
+        return "%s\x1f%s\x1f%s" % (task, state, discriminator)
+
+    def _sent_alert_ids(self) -> set[str]:
+        try:
+            saved = json.loads(self.sent_alerts_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            return set()
+        if isinstance(saved, dict):
+            saved = saved.get("ids")
+        return set(saved) if isinstance(saved, list) and all(isinstance(item, str) for item in saved) else set()
+
+    def _remember_alert_ids(self, alert_ids: Iterable[str]) -> None:
+        additions = list(dict.fromkeys(alert_ids))
+        if not additions:
+            return
+        with self.state._locked(self.sent_alerts_lock_path):
+            try:
+                saved = json.loads(self.sent_alerts_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                saved = []
+            if isinstance(saved, dict):
+                saved = saved.get("ids")
+            saved = saved if isinstance(saved, list) and all(isinstance(item, str) for item in saved) else []
+            saved.extend(item for item in additions if item not in saved)
+            State._write(self.sent_alerts_path, {"ids": saved[-2000:]})
+
+    def _summary(self, alerts: list[tuple[str, str, str, list[str], str]]) -> str:
+        counts: dict[tuple[str, str], int] = {}
+        urls: list[str] = []
+        for task, state, _text, entry_urls, _alert_id in alerts:
+            counts[(task, state)] = counts.get((task, state), 0) + 1
+            for url in entry_urls:
+                if url not in urls:
+                    urls.append(url)
+        korean = any(any(ord(char) > 127 and char.isalpha() for char in label)
+                     for label in self.labels.values())
+        heading = "🚨 Fleet 알림 %d건을 요약합니다." % len(alerts) if korean \
+            else "🚨 Summarizing %d fleet alerts." % len(alerts)
+        # Keep the summary to one Telegram message even if a producer invents
+        # hundreds of task names or PR URLs in one append.
+        limit = MAX_ALERT_TEXT
+        lines = [heading]
+        omitted = 0
+        for (task, state), count in counts.items():
+            line = "• %s · %s (%s): %d" % (task, self.labels[state], state, count)
+            if len("\n".join(lines + [line])) > limit:
+                omitted += 1
+                continue
+            lines.append(line)
+        if urls:
+            lines.append("새 PR:" if korean else "New PRs:")
+            for url in urls:
+                if len("\n".join(lines + [url])) > limit:
+                    omitted += 1
+                    continue
+                lines.append(url)
+        if omitted:
+            lines.append("… 외 %d건" % omitted if korean else "… and %d more" % omitted)
+        return "\n".join(lines)
+
     def poll(self, send: Callable[[str], None]) -> None:
         try:
             size = self.ledger.stat().st_size
@@ -978,19 +1067,39 @@ class FleetAlerts:
             handle.seek(offset)
             pending = handle.read(size - offset)
         # A partial last line waits for its newline.
+        seen = self._sent_alert_ids()
+        planned_prs = self.sent()
+        alerts: list[tuple[str, str, str, list[str], str]] = []
         for line in pending.splitlines(keepends=True):
             if not line.endswith(b"\n"):
                 break
             try:
-                text, urls = self.alert(json.loads(line))
+                record = json.loads(line)
+                text, urls = self.alert(record)
             except ValueError:
                 text, urls = None, []
-            if text:
-                send(text)
-                self.remember(" ".join(urls))
+                record = None
+            if urls and set(urls) <= planned_prs:
+                text, urls = None, []
+            alert_id = self._alert_id(record) if isinstance(record, dict) else None
+            if text and alert_id and alert_id not in seen:
+                key = self._alert_key(record)
+                if key:
+                    alerts.append((record["task"], key, text, urls, alert_id))
+                    seen.add(alert_id)
+                    planned_prs.update(urls)
             offset += len(line)
-            self.state.data["ledger_offset"] = offset
-            self.state.save()
+        if len(alerts) > self.burst_threshold:
+            send(self._summary(alerts))
+            self._remember_alert_ids(entry[4] for entry in alerts)
+            self.remember(" ".join(url for entry in alerts for url in entry[3]))
+        else:
+            for _task, _state, text, urls, alert_id in alerts:
+                send(text)
+                self._remember_alert_ids([alert_id])
+                self.remember(" ".join(urls))
+        self.state.data["ledger_offset"] = offset
+        self.state.save()
 
 
 HEARTBEAT_FILE = "primary-heartbeat.json"
@@ -1959,7 +2068,8 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     whisper = str(config["whisper_cli"] or shutil.which("whisper-cli") or "whisper-cli")
     model, language = _path(config["whisper_model"]), str(config["whisper_language"])
     fleet = FleetAlerts(home / "state/fleet-ledger.jsonl", state,
-                        config["fleet_alert_labels"]) if config["fleet_alerts"] else None
+                        config["fleet_alert_labels"], config["fleet_alert_burst_threshold"]) \
+        if config["fleet_alerts"] else None
     inbox = Inbox(home)
     main_stall = MainStallCheck(inbox, _positive_number(config["main_stall_threshold_seconds"],
                                                          "main_stall_threshold_seconds"), state=state) \
