@@ -203,6 +203,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `failover_command`, `failover_interval_seconds`, `standby_*` | off | Standby fallback on a second machine; see [docs/standby-fallback.md](docs/standby-fallback.md). |
 | `deck_command` | `null` | Command array for [fm-deck](https://github.com/s3onghyun/fm-deck), e.g. `["~/.local/bin/fm-deck"]`. Turns on `/progress` and `/todo` (below). |
 | `deck_timeout_seconds` | `20` | Maximum time for one fm-deck answer. |
+| `topics` | `{}` | Topic name → project/task names, for topics inside the bot chat (below). Off until the bot has Threaded mode. |
 
 | Environment variable | Meaning |
 |----------------------|---------|
@@ -219,7 +220,7 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `~/.config/fm-telegram/config.json` | 0600 (`setup` or you create it) | Configuration. No secrets. |
 | `~/.config/fm-telegram/runtime.env` | 0600 (Linux, `setup` or you create it) | `FM_TELEGRAM_BOT_TOKEN=…`, read by the systemd unit and, when the Keychain has no token, by the bridge. |
 | `~/.local/state/fm-telegram/` | 0700 | State directory. |
-| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram with their source message and which status reactions were attempted, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), and, with `fleet_alerts`, the fleet ledger offset. Saves merge only changed keys under a lock so another process cannot erase them. |
+| `…/state.json` | 0600 | Update offset, reply cursor, ids of notes created from Telegram with their source message and which status reactions were attempted, ids of the last 1000 updates turned into notes (so a redelivered update gets no second download or receipt), with `fleet_alerts`, the fleet ledger offset, and, with `topics`, each topic's thread id and the project of recently dispatched tasks. Saves merge only changed keys under a lock so another process cannot erase them. |
 | `…/pending-choices.json` | 0600 | Pending inline-choice state (for up to seven days), written atomically by `notify` and read fresh for every callback. |
 | `…/sent-prs.txt` | 0600 | With `fleet_alerts`: PR URLs already sent to you, one per line. Never pruned. |
 | `…/media/` | 0700, files 0600 | Downloaded attachments, named `<update id>-<file unique id>[-<name>].<ext>`. Never pruned automatically. |
@@ -273,6 +274,30 @@ Nothing else alerts: dispatch, `working`/`paused`/`resolved` lines, merges, clea
 With `deck_command` set, `/progress` replies with the work under way (elapsed time, last news, what it waits on) and `/todo` with what waits on you (decisions, then mail and GitHub to answer). The bridge runs `<deck_command> telegram progress|todo` and sends its output; it never reads fm-deck's store itself. fm-deck applies its own privacy policy before the text reaches the bridge (company items as counts plus colleague names, career items as counts, its deny list), and the bridge's redactor runs on top. Without `deck_command` the two commands are ordinary notes, as before. Both commands appear in Telegram's command menu when fm-deck is configured.
 
 A morning or evening digest needs no bridge change: `fm-deck telegram digest | python3 ~/.local/share/fm-telegram/fm_telegram.py notify -` from a LaunchAgent or cron entry.
+
+## Optional: topics in the bot chat
+
+Telegram lets a bot's private chat hold topics (Bot API 9.3, "Threaded mode"). With topics the one owner chat is split by project; the security model stays the same, because every topic is still the owner chat.
+
+1. In BotFather's mini app, open the bot's settings and turn on **Threaded mode**. Optionally stop users creating topics, so the list stays the one in the config.
+2. Add the topics and the Firstmate projects or task names that belong to each:
+
+   ```json
+   "topics": {"운동": ["fitness-log"], "OSS 스타": ["personal"], "회사": [], "인스타": ["insta"]}
+   ```
+
+3. Restart the bridge. On start it asks `getMe`; when `has_topics_enabled` is true it creates the missing topics with `createForumTopic` and saves their thread ids in `state.json`. When it is false, the saved ids are dropped and the bridge works as a single chat, as before.
+
+| Flow | Where it goes |
+|------|---------------|
+| A message in a topic | A note starting with `[topic:운동]`; the receipt answers in that topic. A topic not in the config is not tagged, but its replies stay in it. |
+| Firstmate's `fm-inbox.sh reply` | The topic the note came from, quoting the original message. |
+| `notify --topic 운동 …` (also with `--choice`) | That topic. Without `--topic`, or with an unknown name such as `일반`, the general chat. |
+| Fleet alerts | The topic whose list names the task, the project from the task's `task.dispatched` record, or the repository in its PR URL. Otherwise, and for burst summaries, the general chat. |
+| `/status`, `/help`, `/progress`, `/todo` | The topic they were sent in. |
+| Health alerts, standby messages, named routes (미니) | The general chat, as before. |
+
+If Telegram rejects a message for its topic (a deleted topic, or a Bot API outage like [telegram-bot-api#847](https://github.com/tdlib/telegram-bot-api/issues/847)), it is sent again to the general chat, so nothing is lost. A deleted topic is not recreated until its name is removed from the saved ids; remove `topic_threads` from `state.json` and restart to recreate all of them.
 
 ## Optional: standby fallback on a second machine
 

@@ -76,6 +76,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "standby_routes": {},
     "deck_command": None,
     "deck_timeout_seconds": 20,
+    "topics": {},
 }
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
@@ -106,6 +107,7 @@ FLEET_LABELS = {"pr_ready": "✅ **PR ready for review**", "needs-decision": "�
                 "blocked": "⛔ **Blocked**", "failed": "❌ **Failed**", "done": "🏁 **Finished**"}
 MAX_ALERT_TEXT = 600
 PR_URL = re.compile(r"https?://[^\s<>()\[\]]+/(?:pull|merge_requests)/\d+")
+PR_REPO = re.compile(r"/([^/]+)(?:/-)?/(?:pull|merge_requests)/\d+$")
 HTML_TAG = re.compile(r"</?[^>]+>")
 FENCE = re.compile(r"^```([A-Za-z0-9_+-]*)\s*$")
 TABLE_DIVIDER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
@@ -500,9 +502,12 @@ class TelegramAPI:
 
     def send(self, chat_id: int, text: str, parse_mode: Optional[str] = None,
              reply_markup: Optional[dict[str, Any]] = None,
-             reply_to_message_id: Optional[int] = None) -> Any:
+             reply_to_message_id: Optional[int] = None,
+             message_thread_id: Optional[int] = None) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text,
                                    "disable_web_page_preview": True}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup:
@@ -510,6 +515,14 @@ class TelegramAPI:
         if reply_to_message_id is not None:
             payload["reply_to_message_id"] = reply_to_message_id
         return self.call("sendMessage", payload)
+
+    def create_topic(self, chat_id: int, name: str) -> int:
+        """Create a topic in the private bot chat (Bot API 9.4) and return its thread id."""
+        thread = (self.call("createForumTopic", {"chat_id": chat_id, "name": name}) or {}) \
+            .get("message_thread_id")
+        if not isinstance(thread, int):
+            raise RuntimeError("Telegram createForumTopic returned no thread id")
+        return thread
 
     def answer_callback(self, callback_id: str, text: Optional[str] = None) -> Any:
         payload: dict[str, Any] = {"callback_query_id": callback_id}
@@ -920,8 +933,9 @@ class Doorbell:
 class FleetAlerts:
     """Follow Firstmate's fleet ledger and turn captain-relevant records into alerts."""
     def __init__(self, ledger: Path, state: State, labels: Optional[dict[str, str]] = None,
-                 burst_threshold: int = 5) -> None:
+                 burst_threshold: int = 5, topics: Optional[dict[str, list[str]]] = None) -> None:
         self.ledger, self.state = ledger, state
+        self.topics = topics or {}
         self.labels = {**FLEET_LABELS, **(labels or {})}
         self.burst_threshold = burst_threshold if isinstance(burst_threshold, int) \
             and not isinstance(burst_threshold, bool) and burst_threshold > 0 else 5
@@ -965,6 +979,26 @@ class FleetAlerts:
         if urls and set(urls) <= self.sent():
             return None, []
         return "%s · %s\n%s" % (self.labels[key], task, body), urls
+
+    def topic_for(self, record: dict[str, Any]) -> Optional[str]:
+        """The configured topic whose projects name this task, its dispatched project or PR repo."""
+        task = record.get("task")
+        names = {task, (self.state.data.get("fleet_task_projects") or {}).get(task)}
+        body = record.get("pr") if record.get("event") == "task.pr_ready" else record.get("text")
+        for url in PR_URL.findall(body if isinstance(body, str) else ""):
+            names.update(PR_REPO.findall(url))
+        return next((name for name, projects in self.topics.items() if names & set(projects)), None)
+
+    def _note_project(self, record: Any) -> None:
+        """Remember task -> project from dispatch records; status records name only the task."""
+        if not self.topics or not isinstance(record, dict) or record.get("event") != "task.dispatched" \
+                or not isinstance(record.get("task"), str) or not isinstance(record.get("project"), str):
+            return
+        projects = self.state.data.setdefault("fleet_task_projects", {})
+        projects.pop(record["task"], None)
+        projects[record["task"]] = record["project"]
+        for stale in list(projects)[:-500]:
+            del projects[stale]
 
     @staticmethod
     def _alert_key(record: dict[str, Any]) -> Optional[str]:
@@ -1014,10 +1048,10 @@ class FleetAlerts:
             saved.extend(item for item in additions if item not in saved)
             State._write(self.sent_alerts_path, {"ids": saved[-2000:]})
 
-    def _summary(self, alerts: list[tuple[str, str, str, list[str], str]]) -> str:
+    def _summary(self, alerts: list[tuple[str, str, str, list[str], str, Optional[str]]]) -> str:
         counts: dict[tuple[str, str], int] = {}
         urls: list[str] = []
-        for task, state, _text, entry_urls, _alert_id in alerts:
+        for task, state, _text, entry_urls, _alert_id, _topic in alerts:
             counts[(task, state)] = counts.get((task, state), 0) + 1
             for url in entry_urls:
                 if url not in urls:
@@ -1048,7 +1082,8 @@ class FleetAlerts:
             lines.append("… 외 %d건" % omitted if korean else "… and %d more" % omitted)
         return "\n".join(lines)
 
-    def poll(self, send: Callable[[str], None]) -> None:
+    def poll(self, send: Callable[[str, Optional[str]], None]) -> None:
+        """Send new alerts as send(text, topic); topic is None for the general chat."""
         try:
             size = self.ledger.stat().st_size
         except FileNotFoundError:
@@ -1069,12 +1104,13 @@ class FleetAlerts:
         # A partial last line waits for its newline.
         seen = self._sent_alert_ids()
         planned_prs = self.sent()
-        alerts: list[tuple[str, str, str, list[str], str]] = []
+        alerts: list[tuple[str, str, str, list[str], str, Optional[str]]] = []
         for line in pending.splitlines(keepends=True):
             if not line.endswith(b"\n"):
                 break
             try:
                 record = json.loads(line)
+                self._note_project(record)
                 text, urls = self.alert(record)
             except ValueError:
                 text, urls = None, []
@@ -1085,17 +1121,17 @@ class FleetAlerts:
             if text and alert_id and alert_id not in seen:
                 key = self._alert_key(record)
                 if key:
-                    alerts.append((record["task"], key, text, urls, alert_id))
+                    alerts.append((record["task"], key, text, urls, alert_id, self.topic_for(record)))
                     seen.add(alert_id)
                     planned_prs.update(urls)
             offset += len(line)
         if len(alerts) > self.burst_threshold:
-            send(self._summary(alerts))
+            send(self._summary(alerts), None)
             self._remember_alert_ids(entry[4] for entry in alerts)
             self.remember(" ".join(url for entry in alerts for url in entry[3]))
         else:
-            for _task, _state, text, urls, alert_id in alerts:
-                send(text)
+            for _task, _state, text, urls, alert_id, topic in alerts:
+                send(text, topic)
                 self._remember_alert_ids([alert_id])
                 self.remember(" ".join(urls))
         self.state.data["ledger_offset"] = offset
@@ -1375,7 +1411,8 @@ class Bridge:
                  claude_probe: Optional[ClaudeProbeCheck] = None,
                  failover: Optional[Failover] = None,
                  routes: Optional[dict[str, Route]] = None,
-                 deck: Optional[Deck] = None) -> None:
+                 deck: Optional[Deck] = None,
+                 topics: Optional[dict[str, list[str]]] = None) -> None:
         self.api, self.inbox, self.state = api, inbox, state
         self.owner_chat_id, self.redactor, self.log = owner_chat_id, redactor, logger
         self.stopping = False
@@ -1388,6 +1425,43 @@ class Bridge:
         self.failover = failover
         self.routes = routes or {}
         self.deck = deck
+        self.topic_names = list(topics or {})
+
+    @property
+    def topics(self) -> dict[str, int]:
+        """Topic name -> thread id; empty (today's single chat) until Threaded mode is on."""
+        threads = self.state.data.get("topic_threads")
+        return threads if isinstance(threads, dict) else {}
+
+    def topic_thread(self, name: Optional[str]) -> Optional[int]:
+        """A configured topic's thread; None (the general chat) for 일반 or an unknown name."""
+        thread = self.topics.get(name) if name else None
+        return thread if isinstance(thread, int) else None
+
+    def _thread_of(self, message: dict[str, Any]) -> Optional[int]:
+        thread = message.get("message_thread_id")
+        return thread if self.topics and message.get("is_topic_message") is True \
+            and isinstance(thread, int) else None
+
+    def ensure_topics(self) -> None:
+        """Create the configured topics once the bot has Threaded mode (getMe has_topics_enabled)."""
+        if not self.topic_names:
+            return
+        try:
+            enabled = bool((self.api.call("getMe", {}) or {}).get("has_topics_enabled"))
+        except (TelegramAPIError, RuntimeError) as exc:
+            self.log.warning("getMe failed, topics unchanged: %s", self.redactor.redact(str(exc)))
+            return
+        threads = dict(self.topics) if enabled else {}
+        for name in self.topic_names if enabled else ():
+            if name not in threads:
+                try:
+                    threads[name] = self.api.create_topic(self.owner_chat_id, name)
+                except (TelegramAPIError, RuntimeError) as exc:
+                    self.log.warning("createForumTopic failed: %s", self.redactor.redact(str(exc)))
+        if threads != self.topics:
+            self.state.data["topic_threads"] = threads
+            self.state.save()
 
     def labelled(self, sender: str, text: str) -> str:
         """Prefix a relayed secondmate answer with its route label, e.g. "[미니] (인스타 담당) …"."""
@@ -1415,7 +1489,29 @@ class Bridge:
         except (TelegramAPIError, RuntimeError) as exc:
             self.log.warning("setMyCommands failed: %s", self.redactor.redact(str(exc)))
 
-    def send(self, text: str, reply_to_message_id: Optional[int] = None) -> None:
+    def _post(self, html: str, thread_id: Optional[int] = None,
+              reply_to_message_id: Optional[int] = None,
+              reply_markup: Optional[dict[str, Any]] = None) -> Any:
+        """sendMessage to the owner: HTML, then plain text, then plain in the general chat."""
+        target = {key: value for key, value in (("message_thread_id", thread_id),
+                  ("reply_to_message_id", reply_to_message_id), ("reply_markup", reply_markup))
+                  if value is not None}
+        try:
+            return self.api.send(self.owner_chat_id, html, parse_mode="HTML", **target)
+        except TelegramAPIError:
+            pass  # A malformed entity must not swallow a captain-facing result.
+        try:
+            return self.api.send(self.owner_chat_id, _plain_html(html), **target)
+        except TelegramAPIError:
+            if thread_id is None:
+                raise
+        # A deleted topic or a Telegram topic outage (telegram-bot-api#847) must not lose it.
+        self.log.warning("send to topic thread failed, using the general chat")
+        return self.api.send(self.owner_chat_id, _plain_html(html),
+                             **({"reply_markup": reply_markup} if reply_markup else {}))
+
+    def send(self, text: str, reply_to_message_id: Optional[int] = None,
+             thread_id: Optional[int] = None) -> None:
         if len(text) > MAX_OUTBOUND_CHARS:
             text = text[:MAX_OUTBOUND_CHARS] + "\n… (truncated)"
         redacted = self.redactor.redact(text)
@@ -1428,13 +1524,7 @@ class Bridge:
             remaining = 0.05 - (time.monotonic() - self._last_send)
             if remaining > 0:
                 time.sleep(remaining)
-            reply = {"reply_to_message_id": reply_to_message_id} \
-                if reply_to_message_id is not None else {}
-            try:
-                self.api.send(self.owner_chat_id, part, parse_mode="HTML", **reply)
-            except TelegramAPIError:
-                # A malformed entity must not swallow a captain-facing result.
-                self.api.send(self.owner_chat_id, _plain_html(part), **reply)
+            self._post(part, thread_id, reply_to_message_id)
             self._last_send = time.monotonic()
 
     def _expire_choices(self) -> bool:
@@ -1466,7 +1556,8 @@ class Bridge:
             } for option in options])
         return {"inline_keyboard": rows}
 
-    def send_choices(self, text: str, choices: list[dict[str, Any]]) -> None:
+    def send_choices(self, text: str, choices: list[dict[str, Any]],
+                     thread_id: Optional[int] = None) -> None:
         """Send one inline-keyboard notification and persist its reply state first."""
         self._expire_choices()
         redacted_text = self.redactor.redact(text)
@@ -1492,12 +1583,7 @@ class Bridge:
             return request
 
         request = self.state.update_choices(create)
-        try:
-            result = self.api.send(self.owner_chat_id, formatted, parse_mode="HTML",
-                                   reply_markup=self._choice_markup(request))
-        except TelegramAPIError:
-            result = self.api.send(self.owner_chat_id, _plain_html(formatted),
-                                   reply_markup=self._choice_markup(request))
+        result = self._post(formatted, thread_id, reply_markup=self._choice_markup(request))
         message_id = result.get("message_id") if isinstance(result, dict) else None
         if not isinstance(message_id, int):
             raise RuntimeError("Telegram sendMessage returned no message id for choices")
@@ -1639,6 +1725,7 @@ class Bridge:
             self._submit(update_id, text, message=message)
             return
         command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
+        thread = self._thread_of(message)
         if command == "/help":
             self.send("Send text, photos, voice, video or files (up to 20 MB) and each becomes a "
                       "Firstmate note. /status shows the inbox status." +
@@ -1647,13 +1734,13 @@ class Bridge:
                       "diffs out of Telegram; read them on the machine itself." +
                       "".join(" Start with %s야 or %s to send it to %s." % (
                           route.name, route.commands[0] if route.commands else route.name, route.name)
-                          for route in self.routes.values()))
+                          for route in self.routes.values()), thread_id=thread)
             return
         if command == "/status":
-            self.send(self.inbox.status()[:3500] or "No status available.")
+            self.send(self.inbox.status()[:3500] or "No status available.", thread_id=thread)
             return
         if command in DECK_COMMANDS and self.deck:
-            self.send(self.deck.text(DECK_COMMANDS[command]))
+            self.send(self.deck.text(DECK_COMMANDS[command]), thread_id=thread)
             return
         self._submit(update_id, text, message=message)
 
@@ -1741,7 +1828,11 @@ class Bridge:
         messages = self.state.data.setdefault("telegram_note_messages", {})
         if not isinstance(messages, dict):
             messages = self.state.data["telegram_note_messages"] = {}
-        messages.setdefault(note_id, {"chat_id": self.owner_chat_id, "message_id": message_id})
+        source = {"chat_id": self.owner_chat_id, "message_id": message_id}
+        thread = self._thread_of(message)
+        if thread is not None:
+            source["thread_id"] = thread
+        messages.setdefault(note_id, source)
         self.state.save()
 
     def _react_once(self, note_id: Any, state_key: str, emoji: str) -> None:
@@ -1809,6 +1900,11 @@ class Bridge:
 
     def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
                 message: Optional[dict[str, Any]] = None) -> None:
+        thread = self._thread_of(message) if message is not None else None
+        topic = next((name for name, value in self.topics.items() if value == thread), None) \
+            if thread is not None else None
+        if topic:
+            text = "[topic:%s] %s" % (topic, text)
         note = self.inbox.note("tg:%d" % update_id, text)
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
@@ -1821,7 +1917,7 @@ class Bridge:
                 self.doorbell.queue(note_id)
         if message is not None:
             self._remember_note_message(note_id, message)
-        self.send(receipt % note_id)
+        self.send(receipt % note_id, thread_id=thread)
 
     def check_replies(self) -> None:
         receipts = self.inbox.receipts(str(self.state.data.get("receipt_cursor", "")), all_handled=True)
@@ -1831,7 +1927,12 @@ class Bridge:
         for reply in receipts.get("replies", []):
             reply_cursor = str(reply.get("cursor", ""))
             if reply.get("id") in known:
-                self.send(str(reply.get("body", "")))
+                source = (self.state.data.get("telegram_note_messages") or {}).get(reply.get("id"))
+                thread = source.get("thread_id") if isinstance(source, dict) else None
+                if isinstance(thread, int):  # In a topic: same topic, quoting the question.
+                    self.send(str(reply.get("body", "")), source.get("message_id"), thread)
+                else:
+                    self.send(str(reply.get("body", "")))
                 # A published reply completes the note; setMessageReaction replaces 👀.
                 self._react_once(reply.get("id"), "telegram_completed_note_ids", DONE_REACTION)
             # All receipts are consumed to avoid permanent re-polling of unrelated replies.
@@ -1890,7 +1991,7 @@ class Bridge:
             self.doorbell.flush()
         self.check_replies()
         if self.fleet:
-            self.fleet.poll(self.send)
+            self.fleet.poll(lambda text, topic: self.send(text, thread_id=self.topic_thread(topic)))
         if self.main_stall:
             change, text = self.main_stall.poll()
             if change and text:
@@ -1900,6 +2001,7 @@ class Bridge:
 
     def run(self, interval: float) -> None:
         self.register_commands()
+        self.ensure_topics()
         delay = 1.0
         while not self.stopping:
             try:
@@ -2055,6 +2157,16 @@ def _positive_number(value: Any, key: str) -> float:
     return float(value)
 
 
+def parse_topics(value: Any) -> dict[str, list[str]]:
+    """Validate config topics: name -> project/task names whose fleet alerts go to that topic."""
+    if not isinstance(value, dict) or not all(
+            isinstance(name, str) and 0 < len(name.strip()) <= 128 and isinstance(projects, list)
+            and all(isinstance(project, str) for project in projects)
+            for name, projects in value.items()):
+        raise RuntimeError("config topics must map each topic name to a list of project names")
+    return value
+
+
 def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     config = load_config(args.config, args.state_dir / "config.json")
     home = args.home or _path(config["firstmate_home"])
@@ -2067,8 +2179,9 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
     doorbell = Doorbell(home, bool(config["doorbell"]), logger, agent=config["doorbell_agent"])
     whisper = str(config["whisper_cli"] or shutil.which("whisper-cli") or "whisper-cli")
     model, language = _path(config["whisper_model"]), str(config["whisper_language"])
+    topics = parse_topics(config["topics"])
     fleet = FleetAlerts(home / "state/fleet-ledger.jsonl", state,
-                        config["fleet_alert_labels"], config["fleet_alert_burst_threshold"]) \
+                        config["fleet_alert_labels"], config["fleet_alert_burst_threshold"], topics) \
         if config["fleet_alerts"] else None
     inbox = Inbox(home)
     main_stall = MainStallCheck(inbox, _positive_number(config["main_stall_threshold_seconds"],
@@ -2096,7 +2209,7 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
                     transcriber=lambda path: transcribe(path, whisper, model, language),
                     transcript_prefixes=config["transcript_prefixes"], fleet=fleet,
                     main_stall=main_stall, claude_probe=claude_probe, failover=failover,
-                    routes=routes, deck=deck)
+                    routes=routes, deck=deck, topics=topics)
     return bridge, config
 
 
@@ -2436,6 +2549,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="add an inline button; repeat for each option")
     notify.add_argument("--from", dest="sender", metavar="NAME[/HOME]",
                         help="relay a secondmate's answer under its standby_routes label")
+    notify.add_argument("--topic", metavar="NAME",
+                        help="send into this configured topic (default and unknown: the general chat)")
     setup = sub.add_parser("setup", help="create or check the config, token, owner chat and "
                            "run mode; safe to run again")
     setup.add_argument("--firstmate-home", type=Path, help="Firstmate home with bin/fm-inbox.sh")
@@ -2473,10 +2588,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         text = sys.stdin.read() if args.text == "-" else args.text
         if args.sender:
             text = bridge.labelled(args.sender, text)
+        thread = bridge.topic_thread(args.topic)
         if args.choice:
-            bridge.send_choices(text, parse_choices(args.choice))
+            bridge.send_choices(text, parse_choices(args.choice), thread)
         else:
-            bridge.send(text)
+            bridge.send(text, thread_id=thread)
         if bridge.fleet:
             bridge.fleet.remember(text)
         return 0
