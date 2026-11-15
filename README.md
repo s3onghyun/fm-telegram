@@ -158,6 +158,21 @@ cannot be overwritten by the polling state save. A replayed callback uses its Te
 as the stable inbox request id, so retries do not create a second note. Plain `notify` calls are
 unchanged.
 
+### Polls
+
+For a checklist the owner ticks over time, send a non-anonymous Telegram poll:
+
+```sh
+python3 ~/.local/share/fm-telegram/fm_telegram.py notify --topic 운동 --poll '이번 주 운동' \
+  --option '월 스쿼트' --option '수 데드' --option '금 벤치' --multi
+```
+
+The bridge saves the poll id with its question, options and topic in `state.json` (the last 50
+polls). Each vote by the owner becomes one note, such as `[topic:운동] 📊 투표: 이번 주 운동 → 월
+스쿼트, 금 벤치`; retracting a vote notes `→ 취소`. No receipt is sent per vote, and Firstmate's
+reply quotes the poll in its topic. Votes from anyone else and votes on polls this bot did not send
+are ignored. While the standby is polling, it queues the owner's votes silently for the primary.
+
 ### Verify a decision button after deploy
 
 This safe live check sends one test button only to the configured owner chat. Press it and confirm
@@ -292,7 +307,7 @@ Telegram lets a bot's private chat hold topics (Bot API 9.3, "Threaded mode"). W
 |------|---------------|
 | A message in a topic | A note starting with `[topic:운동]`; the receipt answers in that topic. A topic not in the config is not tagged, but its replies stay in it. |
 | Firstmate's `fm-inbox.sh reply` | The topic the note came from, quoting the original message. |
-| `notify --topic 운동 …` (also with `--choice`) | That topic. Without `--topic`, or with an unknown name such as `일반`, the general chat. |
+| `notify --topic 운동 …` (also with `--choice` or `--poll`) | That topic. Without `--topic`, or with an unknown name such as `일반`, the general chat. |
 | Fleet alerts | The topic whose list names the task, the project from the task's `task.dispatched` record, or the repository in its PR URL. Otherwise, and for burst summaries, the general chat. |
 | `/status`, `/help`, `/progress`, `/todo` | The topic they were sent in. |
 | Health alerts, standby messages, named routes (미니) | The general chat, as before. |
