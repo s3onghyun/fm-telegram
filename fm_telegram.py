@@ -41,6 +41,7 @@ DEFAULT_STATE = _xdg("XDG_STATE_HOME", ".local/state") / "fm-telegram"
 DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share") / "fm-telegram"
 TOKEN_ENV = "FM_TELEGRAM_BOT_TOKEN"
 MAX_HANDLED_UPDATES = 1000
+MAX_POLLS = 50  # Sent polls remembered for their votes; a weekly checklist needs a handful.
 SEEN_REACTION = "👀"
 # ✅ is not in Telegram's ReactionTypeEmoji allowed list; 👌 is the closest allowed check.
 DONE_REACTION = "👌"
@@ -485,7 +486,8 @@ class TelegramAPI:
 
     def updates(self, offset: int) -> list[dict[str, Any]]:
         return self.call("getUpdates", {"offset": offset, "timeout": 30,
-                                        "allowed_updates": ["message", "callback_query"]})
+                                        "allowed_updates": ["message", "callback_query",
+                                                            "poll", "poll_answer"]})
 
     def get_file(self, file_id: str, limit: int) -> tuple[str, bytes]:
         """Return Telegram's file_path and contents, refusing anything over limit bytes."""
@@ -1600,6 +1602,63 @@ class Bridge:
 
         self.state.update_choices(remember_message)
 
+    def send_poll(self, question: str, options: list[str], multi: bool = False,
+                  thread_id: Optional[int] = None) -> None:
+        """Send a non-anonymous poll and remember it, so the owner's votes become notes."""
+        question = self.redactor.redact(question)
+        options = [self.redactor.redact(option) for option in options]
+        payload: dict[str, Any] = {"chat_id": self.owner_chat_id, "question": question,
+                                   "options": [{"text": option} for option in options],
+                                   "is_anonymous": False, "allows_multiple_answers": multi}
+        if thread_id is not None:
+            payload["message_thread_id"] = thread_id
+        result = self.api.call("sendPoll", payload) or {}
+        poll_id = (result.get("poll") or {}).get("id")
+        if not isinstance(poll_id, str):
+            raise RuntimeError("Telegram sendPoll returned no poll id")
+        polls = self.state.data.get("polls")
+        polls = dict(polls) if isinstance(polls, dict) else {}
+        polls[poll_id] = {"question": question, "options": options, "thread_id": thread_id,
+                          "message_id": result.get("message_id"),
+                          "topic": next((name for name, value in self.topics.items()
+                                         if value == thread_id), None) if thread_id else None}
+        self.state.data["polls"] = dict(list(polls.items())[-MAX_POLLS:])
+        self.state.save()
+
+    def _handle_poll_answer(self, update_id: Any, answer: Any) -> None:
+        """Note the owner's vote on a poll this bot sent; anyone else's vote is ignored."""
+        if not isinstance(update_id, int) or not isinstance(answer, dict) \
+                or (answer.get("user") or {}).get("id") != self.owner_chat_id:
+            return
+        if update_id in self.state.data.get("handled_update_ids", []):
+            return
+        polls = State._load(self.state.path, {}).get("polls")  # Fresh: notify may have just sent it.
+        poll = polls.get(answer.get("poll_id")) if isinstance(polls, dict) else None
+        if not isinstance(poll, dict):
+            self.log.warning("ignored a vote on an unknown poll")
+            return
+        options = poll.get("options") or []
+        chosen = [options[index] for index in answer.get("option_ids") or []
+                  if isinstance(index, int) and 0 <= index < len(options)]
+        text = "📊 투표: %s → %s" % (poll.get("question"), ", ".join(chosen) or "취소")
+        if poll.get("topic"):
+            text = "[topic:%s] %s" % (poll["topic"], text)
+        note = self.inbox.note("tg:%d" % update_id, text)
+        if isinstance(note, str):  # Compatibility with an Inbox test double.
+            note = Note(note)
+        self._mark_handled(update_id)
+        known = self.state.data.setdefault("telegram_note_ids", [])
+        if note.id not in known:
+            known.append(note.id)
+            if note.created and self.doorbell:
+                self.doorbell.queue(note.id)
+        if isinstance(poll.get("message_id"), int):  # Firstmate's reply quotes the poll, in its topic.
+            source = {"chat_id": self.owner_chat_id, "message_id": poll["message_id"]}
+            if isinstance(poll.get("thread_id"), int):
+                source["thread_id"] = poll["thread_id"]
+            self.state.data.setdefault("telegram_note_messages", {}).setdefault(note.id, source)
+        self.state.save()
+
     def _handle_callback(self, callback: Any) -> None:
         if not isinstance(callback, dict):
             return
@@ -1695,6 +1754,9 @@ class Bridge:
             self._handle_callback(update["callback_query"])
             return
         update_id = update.get("update_id")
+        if "poll_answer" in update:
+            self._handle_poll_answer(update_id, update["poll_answer"])
+            return
         if not isinstance(update_id, int):
             return
         message = update.get("message") or {}
@@ -2056,6 +2118,12 @@ class Standby(Bridge):
 
     def process_update(self, update: dict[str, Any]) -> None:
         update_id, callback = update.get("update_id"), update.get("callback_query")
+        answer = update.get("poll_answer")
+        if isinstance(answer, dict):  # The primary holds the poll; it notes the vote on claim.
+            if isinstance(update_id, int) and (answer.get("user") or {}).get("id") == self.owner_chat_id:
+                update_queue(self.state, lambda updates: None if any(
+                    item.get("update_id") == update_id for item in updates) else updates.append(update))
+            return
         message = (callback.get("message") if isinstance(callback, dict) else update.get("message"))
         message = message if isinstance(message, dict) else {}
         chat_id = (message.get("chat") or {}).get("id")
@@ -2551,13 +2619,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run")
     notify = sub.add_parser("notify", help="send a redacted captain-facing notification")
-    notify.add_argument("text", help="notification text, or - to read stdin")
+    notify.add_argument("text", nargs="?", help="notification text, or - to read stdin")
     notify.add_argument("--choice", action="append", default=[], metavar="QUESTION:OPTION=LABEL",
                         help="add an inline button; repeat for each option")
     notify.add_argument("--from", dest="sender", metavar="NAME[/HOME]",
                         help="relay a secondmate's answer under its standby_routes label")
     notify.add_argument("--topic", metavar="NAME",
                         help="send into this configured topic (default and unknown: the general chat)")
+    notify.add_argument("--poll", metavar="QUESTION",
+                        help="send a non-anonymous poll; the owner's votes become notes")
+    notify.add_argument("--option", action="append", default=[], metavar="TEXT",
+                        help="a --poll answer option; repeat for each (Telegram needs 2-12)")
+    notify.add_argument("--multi", action="store_true", help="let a --poll take several answers")
     setup = sub.add_parser("setup", help="create or check the config, token, owner chat and "
                            "run mode; safe to run again")
     setup.add_argument("--firstmate-home", type=Path, help="Firstmate home with bin/fm-inbox.sh")
@@ -2577,6 +2650,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     standby.add_argument("value", nargs="?", type=int, default=0,
                          help="claim: the primary's offset; ack: last update id taken over")
     args = parser.parse_args(argv)
+    if args.command == "notify" and (args.text is None) == (args.poll is None):
+        parser.error("notify needs either TEXT or --poll QUESTION")
     if args.command == "setup":
         return Setup(args).run()
     if args.command == "standby" and args.action == "deliver":
@@ -2591,6 +2666,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(standby_claim(state, args.value), ensure_ascii=False))
         return 0
     bridge, config = build_standby(args) if args.command == "standby" else build_bridge(args)
+    if args.command == "notify" and args.poll:
+        bridge.send_poll(args.poll, args.option, args.multi, bridge.topic_thread(args.topic))
+        return 0
     if args.command == "notify":
         text = sys.stdin.read() if args.text == "-" else args.text
         if args.sender:

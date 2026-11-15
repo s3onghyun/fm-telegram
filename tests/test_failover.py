@@ -143,6 +143,13 @@ class FailoverTests(Fixture):
                 "message_id": number, "chat": {"id": OWNER}, kind: {"text": "x"}}})
         self.assertEqual(([], []), (self.queued(), self.server.sent))
 
+    def test_standby_queues_only_the_owners_votes_silently(self):
+        for number, user in ((1, OWNER), (2, STRANGER), (1, OWNER)):
+            self.standby.process_update({"update_id": number, "poll_answer": {
+                "poll_id": "p", "user": {"id": user}, "option_ids": [0]}})
+        self.assertEqual([1], [item["update_id"] for item in self.queued()])
+        self.assertEqual([], self.server.sent)
+
     def test_standby_never_polls_behind_the_primary_offset(self):
         fm.standby_claim(self.standby.state, 42)
         self.age_heartbeat(181)
