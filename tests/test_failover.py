@@ -137,6 +137,12 @@ class FailoverTests(Fixture):
         self.assertEqual(3, len(self.queued()))
         self.assertEqual(2, len(self.server.sent))
 
+    def test_standby_ignores_service_messages(self):
+        for number, kind in enumerate(["pinned_message", "forum_topic_created", "new_chat_photo"], 1):
+            self.standby.process_update({"update_id": number, "message": {
+                "message_id": number, "chat": {"id": OWNER}, kind: {"text": "x"}}})
+        self.assertEqual(([], []), (self.queued(), self.server.sent))
+
     def test_standby_never_polls_behind_the_primary_offset(self):
         fm.standby_claim(self.standby.state, 42)
         self.age_heartbeat(181)

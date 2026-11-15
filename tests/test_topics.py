@@ -103,8 +103,13 @@ class TopicTests(unittest.TestCase):
         self.bridge.ensure_topics()
         for number, (kind, thread) in enumerate([("forum_topic_created", 101), ("forum_topic_edited", 101),
                                                  ("forum_topic_closed", 102), ("forum_topic_reopened", 102),
-                                                 ("general_forum_topic_hidden", None)], 20):
-            message = {"message_id": number, "chat": {"id": OWNER}, kind: {"name": "운동"}}
+                                                 ("general_forum_topic_hidden", None),
+                                                 ("pinned_message", 101), ("new_chat_title", None),
+                                                 ("message_auto_delete_timer_changed", None),
+                                                 ("video_chat_started", None), ("write_access_allowed", None)], 20):
+            # A pin nests the pinned message, text and all; it is still not a new note.
+            message = {"message_id": number, "chat": {"id": OWNER},
+                       kind: {"message_id": 1, "chat": {"id": OWNER}, "text": "pinned"}}
             if thread:
                 message.update(message_thread_id=thread, is_topic_message=True)
             self.bridge.process_update({"update_id": number, "message": message})
