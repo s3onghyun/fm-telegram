@@ -91,6 +91,9 @@ VOICE_KINDS = {"voice": "audio/ogg", "audio": "audio/mpeg", "video": "video/mp4"
 MESSAGE_CONTEXT = {"from", "chat", "sender_chat", "reply_to_message", "external_reply", "quote",
                    "forward_origin", "entities", "caption_entities", "reply_markup",
                    "link_preview_options", "via_bot", "sender_business_bot"}
+# Topic service messages (e.g. one per createForumTopic) carry nothing the owner wrote.
+TOPIC_SERVICE = {"forum_topic_created", "forum_topic_edited", "forum_topic_closed",
+                 "forum_topic_reopened", "general_forum_topic_hidden", "general_forum_topic_unhidden"}
 TOKEN_PATTERNS = (
     re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}"),  # Telegram bot token.
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{8,}\b"),
@@ -1700,6 +1703,8 @@ class Bridge:
             return
         if update_id in self.state.data.get("handled_update_ids", []):
             return  # A replayed update: no second download, transcription or receipt.
+        if TOPIC_SERVICE & message.keys():
+            return
         if isinstance(update.get("routed"), str):  # The standby delivered it while we were away.
             self._fyi(update_id, update["routed"], update.get("routed_home"), message)
             return
@@ -2057,7 +2062,7 @@ class Standby(Bridge):
                 self.log.warning("ignored Telegram update from chat id=%d", chat_id)
             return
         handled = self.state.data.setdefault("handled_update_ids", [])
-        if update_id in handled:
+        if update_id in handled or (not callback and TOPIC_SERVICE & message.keys()):
             return
         matched = None if callback else match_route(self.routes, message)
         queued = update

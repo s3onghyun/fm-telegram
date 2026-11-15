@@ -99,6 +99,17 @@ class TopicTests(unittest.TestCase):
         self.bridge.check_replies()
         self.assertEqual((None, None), (self.api.threads[-1], self.api.reply_to_message_ids[-1]))
 
+    def test_topic_service_messages_make_no_note_or_reply(self):
+        self.bridge.ensure_topics()
+        for number, (kind, thread) in enumerate([("forum_topic_created", 101), ("forum_topic_edited", 101),
+                                                 ("forum_topic_closed", 102), ("forum_topic_reopened", 102),
+                                                 ("general_forum_topic_hidden", None)], 20):
+            message = {"message_id": number, "chat": {"id": OWNER}, kind: {"name": "운동"}}
+            if thread:
+                message.update(message_thread_id=thread, is_topic_message=True)
+            self.bridge.process_update({"update_id": number, "message": message})
+        self.assertEqual(([], []), (self.inbox.requests, self.api.sent))
+
     def test_commands_answer_in_the_sending_topic(self):
         self.bridge.ensure_topics()
         self.bridge.process_update(topic_update(8, "/status", 103))
