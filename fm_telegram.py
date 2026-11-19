@@ -65,6 +65,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "fleet_alert_burst_threshold": 5,
     "main_stall_alerts": False,
     "main_stall_threshold_seconds": 600,
+    "main_stall_watcher_down_grace_seconds": 600,
     "claude_probe": False,
     "claude_probe_interval_seconds": 3600,
     "claude_probe_timeout_seconds": 90,
@@ -768,19 +769,40 @@ def _watcher_is_down(status: str, ready: dict[str, Any]) -> bool:
 
 class MainStallCheck:
     def __init__(self, inbox: Any, threshold: float, clock: Callable[[], float] = time.time,
-                 state: Optional[State] = None) -> None:
+                 state: Optional[State] = None, watcher_down_grace: float = 600) -> None:
         self.inbox, self.threshold, self.clock = inbox, threshold, clock
+        self.state, self.watcher_down_grace = state, watcher_down_grace
+        value = state.data.get("main_stall_watcher_down_since") if state else None
+        self.watcher_down_since = float(value) if isinstance(value, (int, float)) \
+            and not isinstance(value, bool) else None
         self.episode = Episode(state, "main_stall_active")
+
+    def _update_watcher_down_since(self, watcher_down: bool, now: float) -> bool:
+        if watcher_down and self.watcher_down_since is None:
+            self.watcher_down_since = now
+        elif not watcher_down and self.watcher_down_since is not None:
+            self.watcher_down_since = None
+        else:
+            return watcher_down and now - self.watcher_down_since >= self.watcher_down_grace
+        if self.state:
+            if self.watcher_down_since is None:
+                self.state.data.pop("main_stall_watcher_down_since", None)
+            else:
+                self.state.data["main_stall_watcher_down_since"] = self.watcher_down_since
+            self.state.save()
+        return watcher_down and now - self.watcher_down_since >= self.watcher_down_grace
 
     def poll(self) -> tuple[int, Optional[str]]:
         pending = self.inbox.pending()
         ready, status = self.inbox.ready(), self.inbox.status()
         oldest = min((item for item in (_note_time(note) for note in pending) if item is not None),
                      default=None)
-        age = self.clock() - oldest if oldest is not None else 0
+        now = self.clock()
+        age = now - oldest if oldest is not None else 0
         waiting = oldest is not None and age >= self.threshold
         watcher_down = _watcher_is_down(status, ready)
-        change = self.episode.update(waiting or watcher_down)
+        watcher_stalled = self._update_watcher_down_since(watcher_down, now)
+        change = self.episode.update(waiting or watcher_stalled)
         if not change:
             return 0, None
         if change < 0:
@@ -788,9 +810,9 @@ class MainStallCheck:
         details: list[str] = []
         if waiting:
             details.append("처리되지 않은 캡틴 메모가 %d분째 대기 중입니다." % max(1, age // 60))
-        if watcher_down:
+        if watcher_stalled:
             details.append("Firstmate watcher가 꺼져 있습니다.")
-        hint = "Firstmate와 watcher를 확인해 주세요." if watcher_down else "Firstmate 메인을 확인해 주세요."
+        hint = "Firstmate와 watcher를 확인해 주세요." if watcher_stalled else "Firstmate 메인을 확인해 주세요."
         return change, "메인 응답 없음\n• " + "\n• ".join(details + [hint])
 
 
@@ -2260,7 +2282,10 @@ def build_bridge(args: argparse.Namespace) -> tuple[Bridge, dict[str, Any]]:
         if config["fleet_alerts"] else None
     inbox = Inbox(home)
     main_stall = MainStallCheck(inbox, _positive_number(config["main_stall_threshold_seconds"],
-                                                         "main_stall_threshold_seconds"), state=state) \
+                                                         "main_stall_threshold_seconds"), state=state,
+                                watcher_down_grace=_positive_number(
+                                    config["main_stall_watcher_down_grace_seconds"],
+                                    "main_stall_watcher_down_grace_seconds")) \
         if config["main_stall_alerts"] else None
     claude_probe = ClaudeProbeCheck(
         _command(config["claude_probe_command"], "claude_probe_command"),

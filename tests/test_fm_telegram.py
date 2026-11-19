@@ -712,26 +712,42 @@ class HealthCheckTests(unittest.TestCase):
         self.assertEqual(-1, change)
         self.assertTrue(recovery.startswith("메인 응답 복구됨"))
 
-    def test_watcher_down_is_a_stall_without_pending_note(self):
+    def test_brief_watcher_down_does_not_alert(self):
+        now = [0.0]
         check = fm.MainStallCheck(self.Inbox(status="warning: watcher still down"), 600,
-                                  clock=lambda: 0)
-        change, alert = check.poll()
-        self.assertEqual(1, change)
-        self.assertIn("watcher", alert)
+                                  clock=lambda: now[0], watcher_down_grace=600)
+        self.assertEqual((0, None), check.poll())
+        now[0] = 599
+        self.assertEqual((0, None), check.poll())
 
-    def test_ready_wake_consumer_down_is_a_stall_without_pending_note(self):
-        ready = {"wake_consumer": {"state": "down"}, "can_receive": False}
-        check = fm.MainStallCheck(self.Inbox(ready=ready), 600, clock=lambda: 0)
+    def test_sustained_watcher_down_alerts_once_then_recovers(self):
+        now = [0.0]
+        inbox = self.Inbox(ready={"wake_consumer": {"state": "down"}, "can_receive": False})
+        check = fm.MainStallCheck(inbox, 600, clock=lambda: now[0], watcher_down_grace=600)
+        self.assertEqual((0, None), check.poll())
+        now[0] = 600
         change, alert = check.poll()
         self.assertEqual(1, change)
         self.assertIn("watcher", alert)
+        self.assertEqual((0, None), check.poll())
+        inbox._ready = {"wake_consumer": {"state": "healthy"}, "can_receive": True}
+        change, recovery = check.poll()
+        self.assertEqual(-1, change)
+        self.assertTrue(recovery.startswith("메인 응답 복구됨"))
 
-    def test_ready_not_receivable_is_a_stall_without_pending_note(self):
-        ready = {"wake_consumer": {"state": "healthy"}, "can_receive": False}
-        check = fm.MainStallCheck(self.Inbox(ready=ready), 600, clock=lambda: 0)
-        change, alert = check.poll()
-        self.assertEqual(1, change)
-        self.assertIn("watcher", alert)
+    def test_watcher_down_grace_survives_restart(self):
+        now = [100.0]
+        inbox = self.Inbox(ready={"can_receive": False})
+        with tempfile.TemporaryDirectory() as temporary:
+            check = fm.MainStallCheck(inbox, 600, clock=lambda: now[0], state=fm.State(Path(temporary)),
+                                      watcher_down_grace=600)
+            self.assertEqual((0, None), check.poll())
+            now[0] = 699
+            check = fm.MainStallCheck(inbox, 600, clock=lambda: now[0], state=fm.State(Path(temporary)),
+                                      watcher_down_grace=600)
+            self.assertEqual((0, None), check.poll())
+            now[0] = 700
+            self.assertEqual(1, check.poll()[0])
 
     def test_probe_classifies_success_auth_failure_and_timeout(self):
         success = [sys.executable, "-c", "print('OK')"]
