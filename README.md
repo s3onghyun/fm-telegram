@@ -207,8 +207,9 @@ The config file is JSON at `~/.config/fm-telegram/config.json` (or `$XDG_CONFIG_
 | `fleet_alerts` | `false` | Send alerts from Firstmate's fleet ledger (below). |
 | `fleet_alert_labels` | `{}` | Replace alert labels, keyed `pr_ready`, `needs-decision`, `blocked`, `failed`, `done`. |
 | `fleet_alert_burst_threshold` | `5` | More alerts than this in one ledger poll are sent as one summary. |
-| `main_stall_alerts` | `false` | Alert when a pending captain note exceeds the threshold or the Firstmate watcher is reported down. |
+| `main_stall_alerts` | `false` | Alert when a pending captain note exceeds its threshold or the Firstmate watcher stays down past its grace period. |
 | `main_stall_threshold_seconds` | `600` | Pending-note age that triggers the main-stall alert. |
+| `main_stall_watcher_down_grace_seconds` | `600` | Continuous watcher-down time before it triggers the main-stall alert. |
 | `claude_probe` | `false` | Run the bounded Claude login/response probe below. |
 | `claude_probe_interval_seconds` | `3600` | Time between completed Claude probes. |
 | `claude_probe_timeout_seconds` | `90` | Maximum time for one Claude probe before it is killed and reported as hung. |
@@ -327,6 +328,7 @@ Enable them only for a Firstmate home whose bridge can already read its public `
 {
   "main_stall_alerts": true,
   "main_stall_threshold_seconds": 600,
+  "main_stall_watcher_down_grace_seconds": 600,
   "claude_probe": true,
   "claude_probe_interval_seconds": 3600,
   "claude_probe_timeout_seconds": 90
@@ -334,7 +336,7 @@ Enable them only for a Firstmate home whose bridge can already read its public `
 ```
 
 With `main_stall_alerts`, the bridge calls `fm-inbox.sh receipts --all-pending`, `ready`, and `status` on its normal polling loop.
-It alerts once when the oldest pending captain note has exceeded the threshold or the public status reports that the watcher is down, then sends one recovery notice after both conditions clear.
+It alerts once when the oldest pending captain note has exceeded the threshold, or after the watcher has been continuously reported down for the configured grace period, then sends one recovery notice after both conditions clear.
 The episode state is kept in the bridge state file, so restarting the bridge does not repeat an active alert.
 
 With `claude_probe`, the bridge starts the configured `claude auth status` command in a background thread at the configured interval.
