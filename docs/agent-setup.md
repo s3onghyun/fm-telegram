@@ -6,7 +6,7 @@ These instructions are for a coding agent (Claude Code, Codex, Pi, …) that a p
 
 1. **Create the bot.** In Telegram, open [@BotFather](https://t.me/BotFather), send `/newbot`, pick a name, and keep the token it shows.
 2. **Enter the token once**, in their own terminal (the input is hidden, so the agent never sees it).
-3. **Send the bot one message** from their own account when setup asks for it.
+3. **Send the bot a one-time code** from their own account when setup asks for it.
 
 ## What the agent does
 
@@ -36,7 +36,7 @@ Never ask the person to paste the token into the chat, never pass it as an argum
 
    It asks for the token with hidden input, checks it with Telegram, and stores it in the macOS Keychain (on Linux in `~/.config/fm-telegram/runtime.env`, mode 0600). When they say it is done, run step 3 again.
 
-5. **Owner chat** (`setup owner need-human: send any message to @<bot> …`). Tell the person to send the bot any message now, from a **private** chat. Setup waits up to 5 minutes (`--wait` changes this), takes the first private message, and prints whose it is. Ask the person to confirm that name is theirs; if not, delete `owner_chat_id` from `~/.config/fm-telegram/config.json` and run step 3 again.
+5. **Owner chat** (`setup owner need-human: send the code <code> to @<bot> …`). Tell the person the six-digit code from that line and ask them to send exactly that code to the bot now, from a **private** chat. Setup waits up to 5 minutes (`--wait` changes this), ignores every message that is not the code (`setup owner skip`), and prints whose chat sent it. Each run prints a new code, so if the wait runs out, run step 3 again and pass on the new one. Ask the person to confirm the printed name is theirs; if not, delete `owner_chat_id` from `~/.config/fm-telegram/config.json` and run step 3 again.
 
 6. **Run mode.** With `--yes`, setup installs a LaunchAgent (macOS) or a systemd user service (Linux) and starts it, unless the Firstmate home is under `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud Drive. macOS privacy protection hides those folders from LaunchAgents, so setup then prints `setup run-mode warn` and a `setup run-mode action` line with the command to keep running instead. Start it in a pane that stays open (tmux or Herdr), for example the `tmux new-session …` command from that line. Use `--run-mode terminal` to always get that command, `--run-mode none` to install nothing.
 

@@ -2544,8 +2544,11 @@ class Setup:
                  ask: Callable[[str], str] = input,
                  interactive: Optional[bool] = None, platform: str = sys.platform,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 pairing_code: Callable[[], str] = lambda: "%06d" % secrets.randbelow(10 ** 6)
+                 ) -> None:
         self.args, self.out = args, out or sys.stdout
+        self.pairing_code = pairing_code
         self.api_factory, self.runner, self.secret, self.ask = api_factory, runner, secret, ask
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.platform, self.clock, self.sleep = platform, clock, sleep
@@ -2683,13 +2686,17 @@ class Setup:
     def detect_owner(self, api: Any, bot: str) -> int:
         if not self.interactive and not self.args.yes:
             raise NeedsHuman("owner", "owner_chat_id is not set. Run setup in a terminal, or "
-                             "add --yes to accept the first private message to @%s" % bot)
+                             "add --yes to accept the private chat that sends @%s the pairing "
+                             "code setup prints" % bot)
         try:
             # Skip the backlog: only a message sent now shows who is setting this bot up.
             backlog = api.call("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}) or []
             offset = max((item["update_id"] for item in backlog), default=-1) + 1
-            self.step("owner", "need-human", "send any message to @%s from your own Telegram "
-                      "account, in a private chat (waiting %ds)" % (bot, self.args.wait))
+            # Anyone who finds the bot can message it during the wait; only the person who
+            # can read this output knows the one-time code.
+            code = self.pairing_code()
+            self.step("owner", "need-human", "send the code %s to @%s from your own Telegram "
+                      "account, in a private chat (waiting %ds)" % (code, bot, self.args.wait))
             deadline = self.clock() + self.args.wait
             while self.clock() < deadline:
                 timeout = max(0, min(30, int(deadline - self.clock())))
@@ -2701,6 +2708,11 @@ class Setup:
                     if chat.get("type") != "private" or not isinstance(chat.get("id"), int):
                         self.step("owner", "skip", "ignored a message from a %s chat; only a "
                                   "private chat can own the bridge" % chat.get("type", "unknown"))
+                        continue
+                    text = (item.get("message") or {}).get("text")
+                    if not isinstance(text, str) or text.strip() != code:
+                        self.step("owner", "skip", "ignored a private message without the "
+                                  "pairing code")
                         continue
                     who = " ".join(part for part in (chat.get("first_name"), chat.get("last_name"))
                                    if part) or "?"
@@ -2719,8 +2731,8 @@ class Setup:
                 raise RuntimeError("Telegram reports another reader of this bot (a running "
                                    "bridge or a webhook); stop it and run setup again") from None
             raise
-        raise NeedsHuman("owner", "no private message reached @%s in %ds; send one and run "
-                         "setup again" % (bot, self.args.wait))
+        raise NeedsHuman("owner", "no private message with the pairing code reached @%s in %ds; "
+                         "run setup again for a new code" % (bot, self.args.wait))
 
     def check_voice(self, config: dict[str, Any]) -> None:
         if self.platform != "darwin":

@@ -16,7 +16,7 @@ If you already run Firstmate, paste this to your coding agent (Claude Code, Code
 
 > Set up the fm-telegram bridge for my Firstmate: follow https://github.com/s3onghyun/fm-telegram/blob/main/docs/agent-setup.md. Never ask me to paste the bot token into this chat.
 
-The agent clones this repository, runs `python3 fm_telegram.py setup`, installs the bridge as a service (or tells you the command to keep running when macOS privacy protection rules a service out) and checks the connection. You do three things: create the bot with [@BotFather](https://t.me/BotFather), type its token once into your own terminal (hidden input), and send the bot one message so it learns your chat. [docs/agent-setup.md](docs/agent-setup.md) lists every step.
+The agent clones this repository, runs `python3 fm_telegram.py setup`, installs the bridge as a service (or tells you the command to keep running when macOS privacy protection rules a service out) and checks the connection. You do three things: create the bot with [@BotFather](https://t.me/BotFather), type its token once into your own terminal (hidden input), and send the bot the one-time code setup prints so it learns your chat. [docs/agent-setup.md](docs/agent-setup.md) lists every step.
 
 Without an agent, run the same command yourself in a terminal; it asks for what it needs and is safe to run again:
 
