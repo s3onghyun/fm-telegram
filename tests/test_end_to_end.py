@@ -162,6 +162,19 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(all(row["parse_mode"] == "HTML" for row in replies))
         self.assertEqual("0002", self.bridge.state.data["receipt_cursor"])
 
+    def test_attachment_telegram_will_not_serve_becomes_a_note_and_the_queue_moves_on(self):
+        # No declared size, and the fake API answers getFile for an unknown id with HTTP 400.
+        self.push(1, OWNER, document={"file_id": "never-there", "file_unique_id": "u1",
+                                      "file_name": "x.bin"})
+        self.push(2, OWNER, text="urgent: stop the deploy")
+        self.bridge.once()
+        notes = self.notes()
+        self.assertEqual("(attachment not received: document, name=x.bin — download failed)",
+                         notes["tg:1"]["body"])
+        self.assertEqual("urgent: stop the deploy", notes["tg:2"]["body"])
+        self.assertEqual(3, self.bridge.state.data["offset"])
+        self.assertTrue(self.server.sent[0]["text"].startswith("Could not save that (download failed)"))
+
     def test_html_rejected_by_telegram_is_resent_as_plain_text(self):
         self.bridge.send("**REJECT-HTML** result")
         self.assertEqual([{"chat_id": OWNER, "text": "REJECT-HTML result",

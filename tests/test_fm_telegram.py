@@ -540,6 +540,50 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual("finished", self.api.sent[-1][1])
         self.assertEqual(["note-tg:48"], self.state.data["telegram_completed_note_ids"])
 
+    def test_whitespace_only_text_is_noted_not_a_crash(self):
+        for number, text in enumerate(("\u3000", "\u00a0", "\u3000\u3000 "), start=1):
+            self.bridge.process_update(update(number, OWNER, text))
+        self.assertEqual([("tg:1", "\u3000"), ("tg:2", "\u00a0"), ("tg:3", "\u3000\u3000 ")],
+                         self.inbox.requests)
+
+    def test_download_error_is_retried_once_then_noted(self):
+        calls = []
+
+        def get_file(file_id, limit):
+            calls.append(file_id)
+            raise RuntimeError("Telegram file download failed")
+        self.api.get_file = get_file
+        self.bridge.process_update(media_update(5, OWNER, "the logs", document={
+            "file_id": "d5", "file_unique_id": "u-d5", "file_name": "log.txt"}))
+        self.assertEqual(["d5", "d5"], calls)
+        self.assertEqual([("tg:5", "(attachment not received: document, name=log.txt — "
+                                   "download failed)\nthe logs")], self.inbox.requests)
+
+    def test_update_that_keeps_failing_is_noted_and_skipped_after_three_attempts(self):
+        broken = {"update_id": 30, "message": ["not", "a", "message"]}
+        self.api.pending_updates = [broken, update(31, OWNER, "next one")]
+        for _attempt in range(fm.MAX_UPDATE_ATTEMPTS - 1):
+            with self.assertRaises(RuntimeError):
+                self.bridge.poll_updates()
+            self.assertEqual([], self.inbox.requests)
+            self.assertEqual(0, self.state.data.get("offset", 0))
+        self.bridge.poll_updates()
+        self.assertEqual([("tg:30", "(message could not be processed: AttributeError)"),
+                          ("tg:31", "next one")], self.inbox.requests)
+        self.assertEqual(32, self.state.data["offset"])
+        self.assertEqual({}, self.state.data["update_failures"])
+        self.assertEqual(3, self.stream.getvalue().count("update id=30 failed (AttributeError)"))
+        self.bridge.poll_updates()  # Redelivered: already handled, nothing new.
+        self.assertEqual(2, len(self.inbox.requests))
+
+    def test_update_is_kept_when_even_the_skip_note_cannot_be_written(self):
+        self.api.pending_updates = [{"update_id": 40, "message": ["broken"]}]
+        self.state.data["update_failures"] = {"40": fm.MAX_UPDATE_ATTEMPTS - 1}
+        self.inbox.note = lambda *_args: (_ for _ in ()).throw(RuntimeError("fm-inbox failed"))
+        with self.assertRaises(RuntimeError):
+            self.bridge.poll_updates()
+        self.assertEqual(0, self.state.data.get("offset", 0))
+
     def test_reply_resumes_after_the_delivered_parts(self):
         self.state.data["telegram_note_ids"] = ["ours"]
         body = "a" * 4000 + "\n\n" + "b" * 4000 + "\n\n" + "c" * 200

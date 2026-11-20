@@ -84,6 +84,7 @@ TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Bot API getFile download limit.
 MAX_REPLY_ATTEMPTS = 3  # Refusals of the same reply part before the rest of it is skipped.
+MAX_UPDATE_ATTEMPTS = 3  # Failed attempts at one update before it is noted and skipped.
 DOORBELL_COOLDOWN_SECONDS = 20.0
 NOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 CHOICE_SPEC = re.compile(r"([A-Za-z0-9_-]{1,16}):([A-Za-z0-9_-]{1,16})=(.+)")
@@ -1867,10 +1868,16 @@ class Bridge:
         text = message.get("text")
         if not isinstance(text, str):
             try:
-                text = self._attachment_text(update_id, message)
+                text = self._download(update_id, message)
                 reason = None if text is not None else "unsupported type"
             except AttachmentTooLarge:
                 reason = "over 20 MB"
+            except (RuntimeError, OSError) as exc:
+                # A file Telegram will not serve fails the same way every time; noting it
+                # keeps later messages from waiting behind it.
+                self.log.warning("attachment download failed for update id=%d: %s", update_id,
+                                 type(exc).__name__)
+                reason = "download failed"
             if reason:
                 # Never drop silently: Firstmate still learns what arrived.
                 caption = message.get("caption")
@@ -1882,7 +1889,8 @@ class Bridge:
                 return
             self._submit(update_id, text, message=message)
             return
-        command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
+        words = text.split(maxsplit=1)  # Empty for text that is only (Unicode) whitespace.
+        command = words[0].split("@", 1)[0] if words else ""
         thread = self._thread_of(message)
         if command == "/help":
             self.send("Send text, photos, voice, video or files (up to 20 MB) and each becomes a "
@@ -1901,6 +1909,15 @@ class Bridge:
             self.send(self.deck.text(DECK_COMMANDS[command]), thread_id=thread)
             return
         self._submit(update_id, text, message=message)
+
+    def _download(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
+        """_attachment_text with one immediate retry for a transient failure."""
+        try:
+            return self._attachment_text(update_id, message)
+        except AttachmentTooLarge:
+            raise
+        except (RuntimeError, OSError):
+            return self._attachment_text(update_id, message)
 
     def _attachment_text(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
         """Download a photo, voice/audio/video or any document; None means unsupported."""
@@ -2155,7 +2172,7 @@ class Bridge:
         try:
             for update in claim["updates"]:
                 try:
-                    self.process_update(update)
+                    self._process_bounded(update)
                 except TelegramAPIError:
                     # E.g. a callback too old to answer; its note was recorded first.
                     self.log.warning("queued update id=%d not fully processed", update["update_id"])
@@ -2172,9 +2189,56 @@ class Bridge:
     def poll_updates(self) -> None:
         offset = int(self.state.data.get("offset", 0))
         for update in self.api.updates(offset):
-            self.process_update(update)
+            self._process_bounded(update)
             self.state.data["offset"] = int(update["update_id"]) + 1
             self.state.save()
+
+    def _process_bounded(self, update: dict[str, Any]) -> None:
+        """process_update, giving up on one update after MAX_UPDATE_ATTEMPTS failures.
+
+        A failure is retried on the next polls (run() backs off). An update that keeps
+        failing is replaced by a short note, so it cannot hold back every later message;
+        if even that note cannot be written, the update stays and is retried as before.
+        """
+        update_id = update.get("update_id")
+        if update_id in self.state.data.get("handled_update_ids", []):
+            return  # Including one skipped here earlier and then redelivered.
+        try:
+            self.process_update(update)
+        except Exception as exc:
+            if not isinstance(update_id, int) or isinstance(update_id, bool):
+                raise
+            failures = self.state.data.get("update_failures")
+            failures = dict(failures) if isinstance(failures, dict) else {}
+            attempts = int(failures.get(str(update_id)) or 0) + 1
+            name = type(exc).__name__
+            self.log.warning("update id=%d failed (%s), attempt %d of %d", update_id, name,
+                             attempts, MAX_UPDATE_ATTEMPTS)
+            if attempts < MAX_UPDATE_ATTEMPTS:
+                failures.pop(str(update_id), None)
+                failures[str(update_id)] = attempts
+                # Keep only recent entries: an update can also expire on Telegram's side.
+                self.state.data["update_failures"] = dict(list(failures.items())[-20:])
+                self.state.save()
+                if isinstance(exc, (RuntimeError, OSError)):
+                    raise
+                raise RuntimeError("update id=%d could not be processed (%s)"
+                                   % (update_id, name)) from exc
+            self._skip_update(update, name)
+        else:
+            failures = self.state.data.get("update_failures")
+            if not (isinstance(failures, dict) and str(update_id) in failures):
+                return
+        failures = dict(self.state.data.get("update_failures") or {})
+        failures.pop(str(update_id), None)
+        self.state.data["update_failures"] = failures
+        self.state.save()
+
+    def _skip_update(self, update: dict[str, Any], error: str) -> None:
+        """Tell Firstmate that an update arrived but could not be processed."""
+        self._submit(update["update_id"], "(message could not be processed: %s)" % error,
+                     "Could not process that message (%s). Only the fact that it arrived was "
+                     "sent as note %%s." % error)
 
     def once(self) -> None:
         self._expire_choices()
@@ -2279,6 +2343,14 @@ class Standby(Bridge):
                 self.api.answer_callback(callback["id"], self.reply[:200])
         else:
             self.send(self.reply)
+
+    def _skip_update(self, update: dict[str, Any], error: str) -> None:
+        """The standby has no inbox of its own: queue the update for the primary unchanged."""
+        def add(updates: list[Any]) -> None:
+            if all(item.get("update_id") != update["update_id"] for item in updates):
+                updates.append(update)
+        update_queue(self.state, add)
+        self._mark_handled(update["update_id"])
 
     def deliver(self, route: Route, update: dict[str, Any]) -> Optional[str]:
         """Note a routed message in the home it belongs to; return that home's key."""
