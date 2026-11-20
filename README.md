@@ -16,7 +16,7 @@ If you already run Firstmate, paste this to your coding agent (Claude Code, Code
 
 > Set up the fm-telegram bridge for my Firstmate: follow https://github.com/s3onghyun/fm-telegram/blob/main/docs/agent-setup.md. Never ask me to paste the bot token into this chat.
 
-The agent clones this repository, runs `python3 fm_telegram.py setup`, installs the bridge as a service (or tells you the command to keep running when macOS privacy protection rules a service out) and checks the connection. You do three things: create the bot with [@BotFather](https://t.me/BotFather), type its token once into your own terminal (hidden input), and send the bot one message so it learns your chat. [docs/agent-setup.md](docs/agent-setup.md) lists every step.
+The agent clones this repository, runs `python3 fm_telegram.py setup`, installs the bridge as a service (or tells you the command to keep running when macOS privacy protection rules a service out) and checks the connection. You do three things: create the bot with [@BotFather](https://t.me/BotFather), type its token once into your own terminal (hidden input), and send the bot the one-time code setup prints so it learns your chat. [docs/agent-setup.md](docs/agent-setup.md) lists every step.
 
 Without an agent, run the same command yourself in a terminal; it asks for what it needs and is safe to run again:
 
@@ -118,7 +118,9 @@ From your phone, send the bot:
 - **Text** — becomes a note. The bot answers `Received. Note ID: <id>`.
 - **Photos and files** (up to 20 MB, the Bot API download limit) — saved to the state directory's `media/` folder; the note contains the caption (or `(photo)` / `(file)`) and an `attachment: <absolute path>` line. File names are kept but reduced to the last path component with separators and punctuation replaced by `_`.
 - **Voice, audio, video, video notes** — saved the same way and transcribed locally. The note starts with the transcript, then the caption, `(voice)` and the `attachment:` line.
-- **Anything else** (stickers, locations, files over 20 MB) — never dropped silently: a note records what arrived, and the bot tells you it could not be saved.
+- **Anything else** (stickers, locations, files over 20 MB, a file Telegram will not serve) — never dropped silently: a note records what arrived, and the bot tells you it could not be saved.
+- A message the bridge fails to process three times in a row becomes the note `(message could not be processed: <error type>)`, so the messages after it are not held back.
+- **Forwarded messages, and replies that quote another message** — become notes like any other, with a first line `[forwarded from user: <name>]` (or `chat:` / `channel:`) or `[quoting another message]`, so Firstmate can tell someone else's words from yours. Control characters are removed from every note.
 - `/status` — a short Firstmate inbox status. `/help` — usage.
 
 Firstmate answers with `fm-inbox.sh reply <note id> <text>`; the bridge picks the reply up from `fm-inbox.sh receipts` and sends it to you. The original Telegram message carries a status reaction, set with Telegram's [setMessageReaction](https://core.telegram.org/bots/api#setmessagereaction): `👀` once Firstmate acknowledges the note (`fm-inbox.sh drain --ack`), then `👌` once the note is completed, meaning the bridge delivers a reply recorded for it with `fm-inbox.sh reply`. Telegram's allowed reaction list has no ✅, so `👌` stands in for a check. Each reaction is attempted once and never repeated after a restart, an acknowledgement that arrives after the reply leaves `👌` in place, and if Telegram rejects a reaction the bridge sends no extra message. Firstmate can also push a notification at any time:
@@ -184,7 +186,7 @@ python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Button delivery check'
   --choice '1:b=Received'
 ```
 
-Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries, and if Telegram rejects the formatting the same part is resent as plain text. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
+Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries into parts within Telegram's 4096-character limit, and if Telegram rejects the formatting the same part is resent as plain text. A reply part Telegram keeps refusing is retried on the next polls without resending the parts already delivered; after three refusals the rest of that reply is replaced by a short notice, so later replies are not held back. Only Telegram refusing the part itself (HTTP 4xx) counts: a rate limit (HTTP 429) waits for the delay Telegram gives, up to five minutes, and a Telegram server error is retried like a network error. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
 
 ## Configuration
 

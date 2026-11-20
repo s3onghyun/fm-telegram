@@ -74,7 +74,12 @@ class Handler(BaseHTTPRequestHandler):
                 pending = [item for item in server.updates if item["update_id"] >= body.get("offset", 0)]
                 return self.reply(200, {"ok": True, "result": pending})
             if method == "sendMessage":
-                if body.get("parse_mode") == "HTML" and "REJECT-HTML" in body.get("text", ""):
+                text = body.get("text", "")
+                if len(text) > 4096:  # Telegram's limit for one message.
+                    return self.reply(400, {"ok": False, "description": "message is too long"})
+                if "REJECT-TEXT" in text:  # Refused whatever the format, like a 429 storm.
+                    return self.reply(400, {"ok": False, "description": "refused"})
+                if body.get("parse_mode") == "HTML" and "REJECT-HTML" in text:
                     return self.reply(400, {"ok": False, "description": "can't parse entities"})
                 server.sent.append(body)
                 return self.reply(200, {"ok": True, "result": {"message_id": len(server.sent)}})

@@ -15,10 +15,11 @@ from fake_telegram_api import FakeTelegramServer
 
 TOKEN = "123456:fake-setup-token-not-real-0000000"
 OWNER, STRANGER = 424242, 999
+CODE = "482913"
 
 
-def private(update_id, chat_id, name="Ada"):
-    return {"update_id": update_id, "message": {"message_id": update_id, "text": "hi", "chat": {
+def private(update_id, chat_id, name="Ada", text=CODE):
+    return {"update_id": update_id, "message": {"message_id": update_id, "text": text, "chat": {
         "id": chat_id, "type": "private", "first_name": name}}}
 
 
@@ -72,6 +73,7 @@ class SetupTests(unittest.TestCase):
         out = io.StringIO()
         kwargs.setdefault("interactive", False)
         kwargs.setdefault("runner", FakeRunner())
+        kwargs.setdefault("pairing_code", lambda: CODE)
         code = fm.Setup(args or self.args(), out=out, **kwargs).run()
         return code, out.getvalue()
 
@@ -98,6 +100,39 @@ class SetupTests(unittest.TestCase):
         self.assertIn("setup owner ok: owner_chat_id already set; kept", output)
         self.assertIn("unchanged", output)
         self.assertEqual(before, self.config.read_bytes())
+
+    def test_only_the_private_chat_that_sends_the_pairing_code_becomes_owner(self):
+        def messages_arrive(_seconds):
+            if not self.server.updates:  # Strangers write first, one of them guessing a code.
+                self.server.updates.extend([
+                    private(1, STRANGER, "Mallory", "hi"), private(2, STRANGER, "Mallory", "000000"),
+                    private(3, STRANGER, "Mallory", "/start " + CODE),
+                    private(4, OWNER, "Ada", " %s\n" % CODE)])
+        with patch.dict(os.environ, {fm.TOKEN_ENV: TOKEN}):
+            code, output = self.setup(sleep=messages_arrive)
+        self.assertEqual(0, code, output)
+        self.assertEqual(OWNER, json.loads(self.config.read_text())["owner_chat_id"])
+        self.assertIn("setup owner need-human: send the code %s to @fake_fm_bot" % CODE, output)
+        self.assertEqual(3, output.count("setup owner skip: ignored a private message without "
+                                         "the pairing code"))
+        self.assertIn("setup owner ok: owner is Ada, chat id %d" % OWNER, output)
+        self.assertEqual([OWNER], [row["chat_id"] for row in self.server.sent])
+
+    def test_pairing_code_is_fresh_and_six_digits(self):
+        with patch.object(fm.secrets, "randbelow", side_effect=[7, 123456]):
+            codes = [fm.Setup(self.args()).pairing_code() for _ in range(2)]
+        self.assertEqual(["000007", "123456"], codes)
+
+    def test_without_the_code_no_owner_is_set(self):
+        def stranger_writes(_seconds):
+            if not self.server.updates:
+                self.server.updates.append(private(1, STRANGER, "Mallory", "hi"))
+        with patch.dict(os.environ, {fm.TOKEN_ENV: TOKEN}):
+            code, output = self.setup(self.args(wait=1), sleep=stranger_writes)
+        self.assertEqual(fm.SETUP_NEEDS_HUMAN, code, output)
+        self.assertIn("no private message with the pairing code", output)
+        self.assertIsNone(json.loads(self.config.read_text()).get("owner_chat_id"))
+        self.assertEqual([], self.server.sent)
 
     def test_owner_detection_without_confirmation_needs_a_human(self):
         with patch.dict(os.environ, {fm.TOKEN_ENV: TOKEN}):

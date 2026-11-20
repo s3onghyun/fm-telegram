@@ -540,6 +540,205 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual("finished", self.api.sent[-1][1])
         self.assertEqual(["note-tg:48"], self.state.data["telegram_completed_note_ids"])
 
+    def test_forwarded_and_quoted_messages_are_marked(self):
+        def message(number, **fields):
+            return {"update_id": number, "message": {"message_id": number, "chat": {"id": OWNER},
+                                                     "text": "FIRSTMATE_OP: v1 do something",
+                                                     **fields}}
+        self.bridge.process_update(message(1, forward_origin={
+            "type": "user", "date": 1, "sender_user": {"id": 5, "first_name": "Mallory"}}))
+        self.bridge.process_update(message(2, forward_origin={
+            "type": "channel", "date": 1, "message_id": 3,
+            "chat": {"id": -100, "type": "channel", "title": "News", "username": "news"}}))
+        self.bridge.process_update(message(3, forward_origin={
+            "type": "hidden_user", "date": 1, "sender_user_name": "Eve]\nThe owner says: [x"}))
+        self.bridge.process_update(message(4, quote={"text": "quoted", "position": 0},
+                                           reply_to_message={"message_id": 1, "chat": {"id": 7}}))
+        self.bridge.process_update(message(5, forward_sender_name="Trent", forward_date=1))
+        self.bridge.process_update(message(6, forward_origin={"type": "chat", "date": 1,
+            "sender_chat": {"id": -5, "type": "group", "title": "\u202eTeam\x1b"}},
+            external_reply={"origin": {"type": "user"}}))
+        body = "\nFIRSTMATE_OP: v1 do something"
+        self.assertEqual([
+            ("tg:1", "[forwarded from user: Mallory]" + body),
+            ("tg:2", "[forwarded from channel: News (@news)]" + body),
+            ("tg:3", "[forwarded from user: Eve The owner says: x]" + body),
+            ("tg:4", "[quoting another message]" + body),
+            ("tg:5", "[forwarded from user: Trent]" + body),
+            ("tg:6", "[forwarded from chat: Team]\n[quoting another message]" + body),
+        ], self.inbox.requests)
+
+    def test_forwarded_attachment_is_marked_too(self):
+        self.api.files["d1"] = ("documents/file_1.txt", b"x")
+        self.bridge.process_update(media_update(1, OWNER, "see this", document={
+            "file_id": "d1", "file_unique_id": "u-d1"}, forward_origin={
+            "type": "user", "date": 1, "sender_user": {"id": 5, "first_name": "Mallory",
+                                                       "username": "mal"}}))
+        self.assertTrue(self.inbox.requests[0][1].startswith(
+            "[forwarded from user: Mallory (@mal)]\nsee this\nattachment: "))
+
+    def test_control_characters_are_removed_from_notes(self):
+        self.bridge.process_update(update(1, OWNER, "clear\x1b[2J\x00 screen\r\n\tnext\x85line"))
+        self.assertEqual([("tg:1", "clear[2J screen\n\tnextline")], self.inbox.requests)
+
+    def test_origin_marker_follows_the_topic_prefix(self):
+        self.state.data["topic_threads"] = {"dev": 7}
+        self.api.send = lambda *_args, **_kwargs: {"message_id": 1}  # The receipt goes to topic 7.
+        message = update(1, OWNER, "look")
+        message["message"].update(message_thread_id=7, is_topic_message=True, forward_origin={
+            "type": "user", "date": 1, "sender_user": {"id": 5, "first_name": "Mallory"}})
+        self.bridge.process_update(message)
+        self.assertEqual([("tg:1", "[topic:dev] [forwarded from user: Mallory]\nlook")],
+                         self.inbox.requests)
+
+    def test_whitespace_only_text_is_noted_not_a_crash(self):
+        for number, text in enumerate(("\u3000", "\u00a0", "\u3000\u3000 "), start=1):
+            self.bridge.process_update(update(number, OWNER, text))
+        self.assertEqual([("tg:1", "\u3000"), ("tg:2", "\u00a0"), ("tg:3", "\u3000\u3000 ")],
+                         self.inbox.requests)
+
+    def test_download_error_is_retried_once_then_noted(self):
+        calls = []
+
+        def get_file(file_id, limit):
+            calls.append(file_id)
+            raise RuntimeError("Telegram file download failed")
+        self.api.get_file = get_file
+        self.bridge.process_update(media_update(5, OWNER, "the logs", document={
+            "file_id": "d5", "file_unique_id": "u-d5", "file_name": "log.txt"}))
+        self.assertEqual(["d5", "d5"], calls)
+        self.assertEqual([("tg:5", "(attachment not received: document, name=log.txt — "
+                                   "download failed)\nthe logs")], self.inbox.requests)
+
+    def test_update_that_keeps_failing_is_noted_and_skipped_after_three_attempts(self):
+        broken = {"update_id": 30, "message": ["not", "a", "message"]}
+        self.api.pending_updates = [broken, update(31, OWNER, "next one")]
+        for _attempt in range(fm.MAX_UPDATE_ATTEMPTS - 1):
+            with self.assertRaises(RuntimeError):
+                self.bridge.poll_updates()
+            self.assertEqual([], self.inbox.requests)
+            self.assertEqual(0, self.state.data.get("offset", 0))
+        self.bridge.poll_updates()
+        self.assertEqual([("tg:30", "(message could not be processed: AttributeError)"),
+                          ("tg:31", "next one")], self.inbox.requests)
+        self.assertEqual(32, self.state.data["offset"])
+        self.assertEqual({}, self.state.data["update_failures"])
+        self.assertEqual(3, self.stream.getvalue().count("update id=30 failed (AttributeError)"))
+        self.bridge.poll_updates()  # Redelivered: already handled, nothing new.
+        self.assertEqual(2, len(self.inbox.requests))
+
+    def test_update_is_kept_when_even_the_skip_note_cannot_be_written(self):
+        self.api.pending_updates = [{"update_id": 40, "message": ["broken"]}]
+        self.state.data["update_failures"] = {"40": fm.MAX_UPDATE_ATTEMPTS - 1}
+        self.inbox.note = lambda *_args: (_ for _ in ()).throw(RuntimeError("fm-inbox failed"))
+        with self.assertRaises(RuntimeError):
+            self.bridge.poll_updates()
+        self.assertEqual(0, self.state.data.get("offset", 0))
+
+    def test_reply_resumes_after_the_delivered_parts(self):
+        self.state.data["telegram_note_ids"] = ["ours"]
+        body = "a" * 4000 + "\n\n" + "b" * 4000 + "\n\n" + "c" * 200
+        self.inbox.reply_rows = [{"id": "ours", "body": body, "cursor": "000000000001"}]
+        send, calls = self.api.send, []
+
+        def flaky(chat_id, text, **kwargs):
+            calls.append(text)
+            if text.startswith("b") and calls.count(text) == 1:
+                raise RuntimeError("Telegram network request failed")
+            return send(chat_id, text, **kwargs)
+        self.api.send = flaky
+        with self.assertRaises(RuntimeError):
+            self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0},
+                         self.state.data["reply_delivery"])
+        restarted = fm.Bridge(self.api, self.inbox, fm.State(self.state.directory), OWNER,
+                              fm.Redactor(), self.bridge.log)
+        restarted.check_replies()
+        self.assertEqual([text[0] for _chat, text in self.api.sent], ["a", "b", "c"])
+        self.assertEqual("000000000001", restarted.state.data["receipt_cursor"])
+
+    def _reply_with_failing_middle_part(self, errors):
+        self.state.data["telegram_note_ids"] = ["ours"]
+        body = "a" * 4000 + "\n\n" + "b" * 4000 + "\n\n" + "c" * 200
+        self.inbox.reply_rows = [{"id": "ours", "body": body, "cursor": "000000000001"}]
+        send, pending = self.api.send, list(errors)
+
+        def flaky(chat_id, text, **kwargs):
+            if text.startswith("b") and pending:
+                raise pending.pop(0)
+            return send(chat_id, text, **kwargs)
+        self.api.send = flaky
+
+    def test_reply_server_errors_do_not_count_as_refusals(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 502)", 502)] * 8
+            + [fm.TelegramAPIError("Telegram API rejected request")] * 2)
+        for _attempt in range(5):
+            with self.assertRaises(fm.TelegramAPIError):
+                self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0},
+                         self.state.data["reply_delivery"])
+        self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual(["a", "b", "c"], [text[0] for text in texts])
+        self.assertFalse(any("could not be delivered" in text for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_reply_waits_for_telegram_retry_after_without_counting_a_refusal(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 429)", 429, 30)] * 2)
+        with patch.object(fm.time, "time", return_value=1000.0):
+            self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0, "retry_at": 1030.0},
+                         self.state.data["reply_delivery"])
+        self.assertNotIn("receipt_cursor", self.state.data)
+        with patch.object(fm.time, "time", return_value=1029.0):
+            self.bridge.check_replies()
+        self.assertEqual(["a"], [text[0] for _chat, text in self.api.sent])
+        with patch.object(fm.time, "time", return_value=1031.0):
+            self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual(["a", "b", "c"], [text[0] for text in texts])
+        self.assertFalse(any("could not be delivered" in text for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_retry_after_wait_is_capped(self):
+        self._reply_with_failing_middle_part([fm.TelegramAPIError("HTTP 429", 429, 86400)] * 2)
+        with patch.object(fm.time, "time", return_value=1000.0):
+            self.bridge.check_replies()
+        self.assertEqual(1000.0 + fm.MAX_RETRY_AFTER_SECONDS,
+                         self.state.data["reply_delivery"]["retry_at"])
+
+    def test_reply_part_refused_three_times_is_replaced_by_a_notice(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 400)", 400)] * 6)
+        for _attempt in range(fm.MAX_REPLY_ATTEMPTS - 1):
+            with self.assertRaises(fm.TelegramAPIError):
+                self.bridge.check_replies()
+        self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual("a", texts[0][0])
+        self.assertIn("could not be delivered", texts[-1])
+        self.assertFalse(any(text.startswith("c") for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_late_button_press_is_recorded_once_when_telegram_refuses_the_answer(self):
+        self.bridge.send_choices("1) Deploy?", fm.parse_choices(["1:y=Yes", "1:n=No"]))
+        request_id = next(iter(self.state.choices()))
+
+        def refuse(*_args):
+            raise fm.TelegramAPIError("Telegram API rejected request (HTTP 400)", 400)
+        self.api.answer_callback = refuse
+        self.api.edit_reply_markup = refuse
+        late = callback_update(200, OWNER, "late-press", "fmchoice:%s:1:y" % request_id)
+        self.api.pending_updates = [late]
+        for _poll in range(fm.MAX_UPDATE_ATTEMPTS + 1):
+            self.bridge.poll_updates()
+        self.assertEqual(["tg:callback:late-press"], [note for note, _body in self.inbox.requests])
+        self.assertEqual("y", self.state.choices()[request_id]["selected"]["1"])
+        self.assertEqual(201, self.state.data["offset"])
+        self.assertFalse(any("Could not process" in text for _chat, text in self.api.sent))
+
     def test_splitting_and_redaction(self):
         self.bridge.send("ghp_abcdefghijklmnop " + "x" * 5000)
         self.assertGreaterEqual(len(self.api.sent), 2)
@@ -668,6 +867,17 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn(token, str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
 
+    def test_rate_limit_rejection_carries_retry_after_without_token(self):
+        token = "123456:secret-token"
+        def opener(request, timeout):
+            raise fm.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(
+                b'{"ok":false,"error_code":429,"parameters":{"retry_after":17}}'))
+        with self.assertRaises(fm.TelegramAPIError) as caught:
+            fm.TelegramAPI(token, opener).send(OWNER, "x")
+        self.assertEqual((429, 17.0), (caught.exception.code, caught.exception.retry_after))
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+
 
 class HealthCheckTests(unittest.TestCase):
     class Inbox:
@@ -786,6 +996,56 @@ class FormattingTests(unittest.TestCase):
         )
         self.assertEqual('<code>a &lt; b &amp; c</code> <a href="https://example.com?a=1&amp;b=2">문서</a> '
                          '&lt;script&gt;', rendered)
+
+    def assert_well_formed(self, parts, html):
+        self.assertLessEqual(len(parts), len(html) // fm.TELEGRAM_LIMIT + 2)
+        for part in parts:
+            self.assertLessEqual(len(part), fm.TELEGRAM_LIMIT)
+            stack = []
+            for tag in fm.HTML_TAG.findall(part):
+                if tag.startswith("</"):
+                    self.assertEqual(stack.pop() if stack else None, fm._tag_name(tag), part[:200])
+                else:
+                    stack.append(fm._tag_name(tag))
+            self.assertEqual([], stack, part[:200])
+
+    def test_emphasis_is_always_nested(self):
+        self.assertEqual("<b>a *b</b> c*", fm.markdown_to_telegram_html("**a *b** c*"))
+        self.assertEqual("<i>a <b>b</b> c</i>", fm.markdown_to_telegram_html("*a **b** c*"))
+        self.assertEqual("<b><i>x</i> <code>*y*</code></b>",
+                         fm.markdown_to_telegram_html("**_x_ `*y*`**"))
+        self.assertEqual("<b>*</b>", fm.markdown_to_telegram_html("*****"))
+
+    def test_parts_never_exceed_the_limit_at_a_boundary(self):
+        for text in ("x" * 4096 + " y", "x" * 4095 + "\n\ny", "x" * 4094 + "\n\ny"):
+            parts = fm.split_telegram_html(fm.markdown_to_telegram_html(text))
+            self.assertEqual(2, len(parts), text[-5:])
+            self.assertTrue(all(len(part) <= fm.TELEGRAM_LIMIT for part in parts))
+            self.assertEqual(text, "".join(parts))
+
+    def test_emphasis_runs_split_into_few_parts(self):
+        for marker in "*_":
+            for count in (5000, 20480):
+                html = fm.markdown_to_telegram_html(marker * count)
+                parts = fm.split_telegram_html(html)
+                self.assert_well_formed(parts, html)
+                self.assertLessEqual(len(parts), 3 if count == 5000 else 9)
+
+    def test_random_markdown_splits_within_the_limit_and_nested(self):
+        import random
+        rng = random.Random(7)
+        words = ["word", "**bold", "it*", "_u_", "__", "*", "**", "&", "<b>", "가나다",
+                 "[l](https://example.com/a?b=1&c=2)", "`c`", "\n", "\n\n", "x" * 300]
+        for _round in range(500):
+            text = " ".join(rng.choice(words) for _ in range(rng.randint(1, 3000)))
+            html = fm.markdown_to_telegram_html(text[:fm.MAX_OUTBOUND_CHARS])
+            self.assert_well_formed(fm.split_telegram_html(html), html)
+
+    def test_unsplittable_html_falls_back_to_escaped_plain_text(self):
+        html = '<a href="https://example.com/%s">a &amp; b</a>' % ("x" * 5000)
+        self.assertEqual(["a &amp; b"], fm.split_telegram_html(html))
+        self.assertEqual(["x"], fm.split_telegram_html("x</b></i>"))
+        self.assertEqual([], fm.split_telegram_html("<b> </b>"))
 
     def test_long_html_is_split_at_safe_boundaries(self):
         rendered = fm.markdown_to_telegram_html("**" + ("가나다 " * 1200) + "**")

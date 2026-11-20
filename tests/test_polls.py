@@ -3,6 +3,7 @@ import io
 import logging
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -32,6 +33,10 @@ class PollTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self.temp.name) / "state"
+        # fm.main defaults --home to FM_HOME; never let a test reach a real Firstmate home.
+        environment = patch.dict(fm.os.environ, {"FM_HOME": self.temp.name})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.api, self.inbox = PollTelegram(), FakeInbox()
         self.log = logging.getLogger("test-polls")
         self.log.handlers[:] = [logging.StreamHandler(io.StringIO())]

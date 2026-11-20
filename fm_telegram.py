@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +84,9 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Bot API getFile download limit.
+MAX_REPLY_ATTEMPTS = 3  # Refusals of the same reply part before the rest of it is skipped.
+MAX_RETRY_AFTER_SECONDS = 300.0  # Longest wait honoured from a Telegram 429 retry_after.
+MAX_UPDATE_ATTEMPTS = 3  # Failed attempts at one update before it is noted and skipped.
 DOORBELL_COOLDOWN_SECONDS = 20.0
 NOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 CHOICE_SPEC = re.compile(r"([A-Za-z0-9_-]{1,16}):([A-Za-z0-9_-]{1,16})=(.+)")
@@ -92,12 +96,15 @@ VOICE_KINDS = {"voice": "audio/ogg", "audio": "audio/mpeg", "video": "video/mp4"
 # Structured message fields that are context, not the content the owner sent.
 MESSAGE_CONTEXT = {"from", "chat", "sender_chat", "reply_to_message", "external_reply", "quote",
                    "forward_origin", "entities", "caption_entities", "reply_markup",
-                   "link_preview_options", "via_bot", "sender_business_bot"}
+                   "link_preview_options", "via_bot", "sender_business_bot",
+                   "forward_from", "forward_from_chat"}
 # Fields that carry something the owner sent. A message with none of them is a service
 # message (pin, topic event, title change, video chat, ...) and is ignored, not noted.
 USER_CONTENT = {"text", "caption", "photo", "document", "voice", "audio", "video", "video_note",
                 "animation", "sticker", "contact", "location", "venue", "poll", "dice", "game",
                 "story", "paid_media", "checklist"}
+# C0 and C1 control characters other than tab and newline: never part of what the owner typed.
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 TOKEN_PATTERNS = (
     re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}"),  # Telegram bot token.
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{8,}\b"),
@@ -123,9 +130,23 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-+*]|\d+[.)])\s+(.*)$")
 
 class TelegramAPIError(RuntimeError):
     """A response from Telegram was valid HTTP but rejected the message."""
-    def __init__(self, message: str, code: Optional[int] = None) -> None:
+    def __init__(self, message: str, code: Optional[int] = None,
+                 retry_after: Optional[float] = None) -> None:
         super().__init__(message)
         self.code = code  # 409 means another getUpdates poller is running.
+        self.retry_after = retry_after  # Seconds Telegram asks to wait (HTTP 429).
+
+    @property
+    def content_refusal(self) -> bool:
+        """Telegram refused the request itself, not a rate limit or a server failure."""
+        return self.code is not None and 400 <= self.code < 500 and self.code != 429
+
+
+def _retry_after(body: Any) -> Optional[float]:
+    value = ((body.get("parameters") if isinstance(body, dict) else None) or {}).get("retry_after")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
 
 
 class AttachmentTooLarge(RuntimeError):
@@ -156,6 +177,17 @@ def _inline_html(value: str) -> str:
         saved.append(rendered)
         return marker
 
+    def restore(text: str) -> str:
+        return re.sub(r"\x00TG(\d+)\x00", lambda match: saved[int(match.group(1))], text)
+
+    def italic(text: str) -> str:
+        text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+        return re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+
+    def bold(match: re.Match[str]) -> str:
+        # Saved whole, so the italic pass over the rest never sees half of a bold span.
+        return save(restore("<b>%s</b>" % italic(match.group(1))))
+
     def code(match: re.Match[str]) -> str:
         return save("<code>%s</code>" % html.escape(match.group(1)))
 
@@ -169,14 +201,11 @@ def _inline_html(value: str) -> str:
     value = re.sub(r"`([^`\n]+)`", code, value)
     value = re.sub(r"\[([^\]\n]+)\]\(([^)\s]+)\)", link, value)
     value = html.escape(value)
-    # The deliberate ordering makes bold markers disappear before italic markers.
-    value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
-    value = re.sub(r"__(.+?)__", r"<b>\1</b>", value)
-    value = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", value)
-    value = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", value)
-    for index, rendered in enumerate(saved):
-        value = value.replace("\x00TG%d\x00" % index, rendered)
-    return value
+    # Bold first, so its markers disappear before the italic pass; italics inside a bold
+    # span are rendered within it, which keeps the tags nested.
+    value = re.sub(r"\*\*(.+?)\*\*", bold, value)
+    value = re.sub(r"__(.+?)__", bold, value)
+    return restore(italic(value))
 
 
 def _table_cells(line: str) -> list[str]:
@@ -242,23 +271,44 @@ def markdown_to_telegram_html(text: str) -> str:
 
 
 def _safe_text_cut(value: str, maximum: int) -> int:
-    """Prefer paragraph/line/word boundaries and never split an HTML entity."""
+    """Prefer paragraph/line/word boundaries and never split an HTML entity.
+
+    The cut is at most maximum. A boundary in the last quarter wins, so no part is
+    needlessly short; without one, the last boundary anywhere (or maximum) is used.
+    """
     if len(value) <= maximum:
         return len(value)
-    candidates = (value.rfind("\n\n", 0, maximum + 1), value.rfind("\n", 0, maximum + 1),
-                  value.rfind(" ", 0, maximum + 1))
-    cut = next((point + (2 if point == candidates[0] else 1)
-                for point in candidates if point > 0), maximum)
+    window = value[:maximum + 1]
+    found = [(window.rfind(separator), len(separator)) for separator in ("\n\n", "\n", " ")]
+    late = [(point, size) for point, size in found if point >= maximum * 3 // 4]
+    point, size = next(iter(late or sorted(found, reverse=True)))
+    cut = min(point + size, maximum) if point > 0 else maximum
     ampersand = value.rfind("&", 0, cut)
     if ampersand >= 0 and ";" not in value[ampersand:cut]:
         cut = ampersand
     return cut
 
 
-def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """Split generated Telegram HTML without breaking a tag or leaving it unbalanced."""
-    if limit < 32:
-        raise ValueError("Telegram HTML limit is too small")
+def _text_parts(value: str, limit: int, boundaries: bool = True) -> list[str]:
+    """Split escaped text that holds no tags into parts of at most limit characters."""
+    parts = []
+    while value:
+        cut = _safe_text_cut(value, limit) if boundaries else min(len(value), limit)
+        if not boundaries and cut < len(value):
+            ampersand = value.rfind("&", 0, cut)
+            if ampersand > 0 and ";" not in value[ampersand:cut]:
+                cut = ampersand
+        cut = cut or min(len(value), limit)
+        parts.append(value[:cut])
+        value = value[cut:]
+    return parts
+
+
+class _SplitFailed(Exception):
+    """The generated HTML cannot be split within the limit; fall back to plain text."""
+
+
+def _split_html(value: str, limit: int) -> list[str]:
     tokens = re.split(r"(<[^>]+>)", value)
     result: list[str] = []
     open_tags: list[tuple[str, str]] = []
@@ -268,39 +318,46 @@ def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     def closers() -> str:
         return "".join("</%s>" % name for name, _tag in reversed(open_tags))
 
+    def size() -> int:
+        return len(prefix) + len(current) + len(closers())
+
     def flush() -> None:
         nonlocal prefix, current
-        if current:
-            result.append(prefix + current + closers())
+        if not current:
+            raise _SplitFailed()  # Even an empty part has no room: give up, never loop.
+        result.append(prefix + current + closers())
         prefix = "".join(tag for _name, tag in open_tags)
         current = ""
 
     for token in tokens:
         if not token:
             continue
+        if token.startswith("</"):
+            name = _tag_name(token)
+            names = [open_name for open_name, _tag in open_tags]
+            if name not in names:
+                continue  # A closer with nothing to close would make Telegram reject the part.
+            # Close any tag opened after the matching one too, so the output stays nested.
+            # Their closers were already counted in size(), so this never adds length.
+            while open_tags[-1][0] != name:
+                current += "</%s>" % open_tags.pop()[0]
+            open_tags.pop()
+            current += token
+            continue
         if token.startswith("<"):
             name = _tag_name(token)
-            if token.startswith("</"):
-                if len(prefix) + len(current) + len(token) + len(closers()) <= limit:
-                    current += token
-                else:
-                    flush()
-                    current += token
-                if name and open_tags and open_tags[-1][0] == name:
-                    open_tags.pop()
-            else:
-                if len(prefix) + len(current) + len(token) + len(closers()) > limit:
-                    flush()
-                current += token
-                if name and not token.endswith("/>"):
-                    open_tags.append((name, token))
+            closer = len("</%s>" % name) if name and not token.endswith("/>") else 0
+            if size() + len(token) + closer > limit:
+                flush()
+                if size() + len(token) + closer > limit:
+                    raise _SplitFailed()
+            current += token
+            if closer:
+                open_tags.append((name, token))
             continue
         while token:
-            space = limit - len(prefix) - len(current) - len(closers())
-            if space <= 0:
-                flush()
-                continue
-            cut = _safe_text_cut(token, space)
+            space = limit - size()
+            cut = _safe_text_cut(token, space) if space > 0 else 0
             if cut == 0:
                 flush()
                 continue
@@ -308,8 +365,32 @@ def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
             token = token[cut:]
             if token:
                 flush()
-    flush()
+    if current:
+        flush()
     return result
+
+
+def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    """Split generated Telegram HTML without breaking a tag or leaving it unbalanced.
+
+    Every part is at most limit characters and well nested, and there are at most
+    len(value) // limit + 2 parts. Input the splitter cannot honour that for is sent
+    as escaped plain text instead.
+    """
+    if limit < 32:
+        raise ValueError("Telegram HTML limit is too small")
+    most = len(value) // limit + 2
+    try:
+        parts = _split_html(value, limit)
+    except _SplitFailed:
+        parts = []
+    if not (parts and len(parts) <= most and all(len(part) <= limit for part in parts)):
+        plain = html.escape(_plain_html(value), quote=False)
+        parts = _text_parts(plain, limit)
+        if len(parts) > most:
+            parts = _text_parts(plain, limit, boundaries=False)
+    # Telegram refuses a message with no visible text.
+    return [part for part in parts if _plain_html(part).strip()]
 
 
 class Redactor:
@@ -476,13 +557,21 @@ class TelegramAPI:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             # Telegram reports rejections (bad entities, 401, 409, 429) as HTTP 4xx.
-            exc.close()
+            try:
+                error = json.loads(exc.read(65536).decode("utf-8"))
+            except (AttributeError, OSError, ValueError):
+                error = None
+            finally:
+                exc.close()
             raise TelegramAPIError("Telegram API rejected request (HTTP %d)" % exc.code,
-                                   exc.code) from None
+                                   exc.code, _retry_after(error)) from None
         except (URLError, OSError, ValueError) as exc:
             raise RuntimeError("Telegram network request failed") from exc
         if not body.get("ok"):
-            raise TelegramAPIError("Telegram API rejected request")
+            code = body.get("error_code")
+            raise TelegramAPIError("Telegram API rejected request",
+                                   code if isinstance(code, int) and not isinstance(code, bool)
+                                   else None, _retry_after(body))
         return body.get("result")
 
     def updates(self, offset: int) -> list[dict[str, Any]]:
@@ -1287,6 +1376,67 @@ BOT_COMMAND = re.compile(r"/[a-z0-9_]{1,32}")
 ROUTE_EMOJI = "👨‍💻"  # 🖥️ is not a Telegram reaction; 👨‍💻 is the closest allowed one.
 
 
+def _note_body(text: str) -> str:
+    """Remove control characters from a note body (terminal escapes, NUL, ...)."""
+    return CONTROL_CHARACTERS.sub("", text)
+
+
+def _display_name(value: Any) -> str:
+    """A name from Telegram, reduced to one plain line that cannot end the origin marker."""
+    if not isinstance(value, str):
+        return ""
+    value = "".join(" " if character in "[]" or character.isspace() else character
+                    for character in value if unicodedata.category(character) not in {"Cc", "Cf"})
+    return " ".join(value.split())[:64]
+
+
+def _sender(person: Any, kind: str) -> str:
+    """Label a Telegram User or Chat object, e.g. 'user: Ada Lovelace (@ada)'."""
+    person = person if isinstance(person, dict) else {}
+    name = _display_name(person.get("title")) or _display_name(" ".join(
+        part for part in (person.get("first_name"), person.get("last_name")) if isinstance(part, str)))
+    username = _display_name(person.get("username"))
+    label = " ".join(part for part in (name, "(@%s)" % username if username else "") if part)
+    return "%s: %s" % (kind, label or "unknown")
+
+
+def origin_lines(message: dict[str, Any]) -> list[str]:
+    """Marker lines for content the owner did not write: a forward, or a quote of another message.
+
+    The note body is otherwise exactly what arrived, so without these a forwarded stranger's
+    words would read as the owner's own.
+    """
+    lines = []
+    origin = message.get("forward_origin")
+    if isinstance(origin, dict):
+        kind = origin.get("type")
+        if kind == "user":
+            source = _sender(origin.get("sender_user"), "user")
+        elif kind == "hidden_user":
+            source = "user: %s" % (_display_name(origin.get("sender_user_name")) or "unknown")
+        elif kind == "chat":
+            source = _sender(origin.get("sender_chat"), "chat")
+        elif kind == "channel":
+            source = _sender(origin.get("chat"), "channel")
+        else:
+            source = "unknown"
+        lines.append("[forwarded from %s]" % source)
+    elif isinstance(message.get("forward_from"), dict):  # Bot API before 7.0.
+        lines.append("[forwarded from %s]" % _sender(message["forward_from"], "user"))
+    elif isinstance(message.get("forward_from_chat"), dict):
+        lines.append("[forwarded from %s]" % _sender(message["forward_from_chat"], "chat"))
+    elif "forward_sender_name" in message or "forward_date" in message:
+        lines.append("[forwarded from user: %s]"
+                     % (_display_name(message.get("forward_sender_name")) or "unknown"))
+    if isinstance(message.get("quote"), dict) or isinstance(message.get("external_reply"), dict):
+        lines.append("[quoting another message]")
+    return lines
+
+
+def _with_origin(message: dict[str, Any], text: str) -> str:
+    return "\n".join(origin_lines(message) + [text])
+
+
 def _reply_text(message: dict[str, Any]) -> str:
     reply = message.get("reply_to_message")
     reply = reply if isinstance(reply, dict) else {}
@@ -1540,14 +1690,18 @@ class Bridge:
                              **({"reply_markup": reply_markup} if reply_markup else {}))
 
     def send(self, text: str, reply_to_message_id: Optional[int] = None,
-             thread_id: Optional[int] = None) -> None:
+             thread_id: Optional[int] = None, start: int = 0,
+             sent: Optional[Callable[[int], None]] = None) -> None:
+        """Send text as one or more parts, from part number start; sent(n) follows each."""
         if len(text) > MAX_OUTBOUND_CHARS:
             text = text[:MAX_OUTBOUND_CHARS] + "\n… (truncated)"
         redacted = self.redactor.redact(text)
         if not redacted:
             return
         formatted = markdown_to_telegram_html(redacted)
-        for part in split_telegram_html(formatted):
+        for number, part in enumerate(split_telegram_html(formatted)):
+            if number < start:
+                continue  # Delivered by an earlier attempt.
             # Telegram permits considerably more than this, but a modest local cap
             # keeps a long reply from becoming a burst of outbound API requests.
             remaining = 0.05 - (time.monotonic() - self._last_send)
@@ -1555,6 +1709,8 @@ class Bridge:
                 time.sleep(remaining)
             self._post(part, thread_id, reply_to_message_id)
             self._last_send = time.monotonic()
+            if sent:
+                sent(number + 1)
 
     def _expire_choices(self) -> bool:
         cutoff = time.time() - CHOICE_TTL_SECONDS
@@ -1699,39 +1855,39 @@ class Bridge:
         parts = data.split(":") if isinstance(data, str) else []
         if len(parts) != 4 or parts[0] != "fmchoice":
             self.log.warning("unknown Telegram callback format")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         request_id, question_id, option_id = parts[1:]
         pending = self.state.choices().get(request_id)
         if not isinstance(pending, dict):
             self.log.warning("unknown Telegram choice callback")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         if message.get("message_id") != pending.get("message_id"):
             self.log.warning("unknown Telegram choice callback message")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         question = next((item for item in pending.get("questions", [])
                          if item.get("id") == question_id), None)
         if not isinstance(question, dict):
             self.log.warning("unknown Telegram choice question")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         option = next((item for item in question.get("options", [])
                        if item.get("id") == option_id), None)
         if not isinstance(option, dict):
             self.log.warning("unknown Telegram choice option")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         selected = pending.get("selected", {})
         if not isinstance(selected, dict):
             selected = {}
         if question_id in selected:
-            self.api.answer_callback(callback_id, "이미 받았어요")
+            self._answer_callback(callback_id, "이미 받았어요")
             return
         if not NOTE_ID.fullmatch(callback_id):
             self.log.warning("ignored Telegram callback with unsafe id")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         body = "Decision reply to %s: %s%s\nQuestion: %s\nSelected: %s" % (
             request_id, question_id, option_id, question["text"], option["label"])
@@ -1739,7 +1895,7 @@ class Bridge:
             note = self.inbox.note("tg:callback:" + callback_id, body)
         except (OSError, RuntimeError):
             self.log.warning("failed to record Telegram choice callback")
-            self.api.answer_callback(callback_id, "처리하지 못했어요, 다시 눌러 주세요")
+            self._answer_callback(callback_id, "처리하지 못했어요, 다시 눌러 주세요")
             raise
         if isinstance(note, str):
             note = Note(note)
@@ -1762,14 +1918,24 @@ class Bridge:
 
         chosen = self.state.update_choices(select)
         if not isinstance(chosen, dict):
-            self.api.answer_callback(callback_id, "이미 받았어요")
+            self._answer_callback(callback_id, "이미 받았어요")
             return
         self.state.save()
-        self.api.answer_callback(callback_id, "받았어요 ✓ %s%s" % (question_id, option_id))
+        self._answer_callback(callback_id, "받았어요 ✓ %s%s" % (question_id, option_id))
         message_id = chosen.get("message_id")
         if isinstance(message_id, int):
-            self.api.edit_reply_markup(self.owner_chat_id, message_id,
-                                       self._choice_markup(chosen))
+            try:
+                self.api.edit_reply_markup(self.owner_chat_id, message_id,
+                                           self._choice_markup(chosen))
+            except TelegramAPIError:
+                self.log.warning("Telegram refused to update the choice buttons")
+
+    def _answer_callback(self, callback_id: str, text: str) -> None:
+        """Acknowledge a button press; Telegram refuses this for an old one."""
+        try:
+            self.api.answer_callback(callback_id, text)
+        except TelegramAPIError:
+            self.log.warning("Telegram refused to answer a choice callback")
 
     def process_update(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -1800,22 +1966,29 @@ class Bridge:
         text = message.get("text")
         if not isinstance(text, str):
             try:
-                text = self._attachment_text(update_id, message)
+                text = self._download(update_id, message)
                 reason = None if text is not None else "unsupported type"
             except AttachmentTooLarge:
                 reason = "over 20 MB"
+            except (RuntimeError, OSError) as exc:
+                # A file Telegram will not serve fails the same way every time; noting it
+                # keeps later messages from waiting behind it.
+                self.log.warning("attachment download failed for update id=%d: %s", update_id,
+                                 type(exc).__name__)
+                reason = "download failed"
             if reason:
                 # Never drop silently: Firstmate still learns what arrived.
                 caption = message.get("caption")
                 note = "(attachment not received: %s — %s)" % (self._describe(message), reason)
                 if isinstance(caption, str) and caption.strip():
                     note += "\n" + caption
-                self._submit(update_id, note, "Could not save that (%s). Only the fact that it "
-                             "arrived was sent as note %%s." % reason, message)
+                self._submit(update_id, _with_origin(message, note), "Could not save that (%s). "
+                             "Only the fact that it arrived was sent as note %%s." % reason, message)
                 return
-            self._submit(update_id, text, message=message)
+            self._submit(update_id, _with_origin(message, text), message=message)
             return
-        command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
+        words = text.split(maxsplit=1)  # Empty for text that is only (Unicode) whitespace.
+        command = words[0].split("@", 1)[0] if words else ""
         thread = self._thread_of(message)
         if command == "/help":
             self.send("Send text, photos, voice, video or files (up to 20 MB) and each becomes a "
@@ -1833,7 +2006,16 @@ class Bridge:
         if command in DECK_COMMANDS and self.deck:
             self.send(self.deck.text(DECK_COMMANDS[command]), thread_id=thread)
             return
-        self._submit(update_id, text, message=message)
+        self._submit(update_id, _with_origin(message, text), message=message)
+
+    def _download(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
+        """_attachment_text with one immediate retry for a transient failure."""
+        try:
+            return self._attachment_text(update_id, message)
+        except AttachmentTooLarge:
+            raise
+        except (RuntimeError, OSError):
+            return self._attachment_text(update_id, message)
 
     def _attachment_text(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
         """Download a photo, voice/audio/video or any document; None means unsupported."""
@@ -1984,9 +2166,10 @@ class Bridge:
             text = "(%s)" % self._describe(message)
         target = name + ("/%s" % home if isinstance(home, str) else "")
         # Not added to telegram_note_ids, so a reply to this note never reaches Telegram.
-        self.inbox.note("tg:%d" % update_id, "[FYI routed-to:%s] The owner sent this to %s on the "
-                        "standby machine, which already has it. Read-only copy: no reply "
-                        "needed.\n%s" % (target, name, text))
+        self.inbox.note("tg:%d" % update_id, _note_body(
+            "[FYI routed-to:%s] The owner sent this to %s on the standby machine, which already "
+            "has it. Read-only copy: no reply needed.\n%s" % (target, name,
+                                                               _with_origin(message, text))))
         self._mark_handled(update_id)
 
     def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
@@ -1996,7 +2179,7 @@ class Bridge:
             if thread is not None else None
         if topic:
             text = "[topic:%s] %s" % (topic, text)
-        note = self.inbox.note("tg:%d" % update_id, text)
+        note = self.inbox.note("tg:%d" % update_id, _note_body(text))
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
         note_id = note.id
@@ -2018,21 +2201,73 @@ class Bridge:
         for reply in receipts.get("replies", []):
             reply_cursor = str(reply.get("cursor", ""))
             if reply.get("id") in known:
-                source = (self.state.data.get("telegram_note_messages") or {}).get(reply.get("id"))
-                thread = source.get("thread_id") if isinstance(source, dict) else None
-                if isinstance(thread, int):  # In a topic: same topic, quoting the question.
-                    self.send(str(reply.get("body", "")), source.get("message_id"), thread)
-                else:
-                    self.send(str(reply.get("body", "")))
+                if not self._deliver_reply(reply, reply_cursor):
+                    break  # Telegram asked to wait; this reply is retried after that.
                 # A published reply completes the note; setMessageReaction replaces 👀.
                 self._react_once(reply.get("id"), "telegram_completed_note_ids", DONE_REACTION)
             # All receipts are consumed to avoid permanent re-polling of unrelated replies.
             cursor = reply_cursor or cursor
             self.state.data["receipt_cursor"] = cursor
+            self.state.data.pop("reply_delivery", None)
             self.state.save()
         if not receipts.get("replies") and receipts.get("reply_cursor"):
             self.state.data["receipt_cursor"] = str(receipts["reply_cursor"])
             self.state.save()
+
+    def _deliver_reply(self, reply: dict[str, Any], reply_cursor: str) -> bool:
+        """Send one reply, resuming after the parts an earlier attempt delivered.
+
+        A part Telegram keeps refusing (HTTP 4xx other than 429) is retried on the next
+        polls; after MAX_REPLY_ATTEMPTS refusals in a row the rest of the reply is replaced
+        by a short notice, so one bad reply never repeats itself or holds back the replies
+        after it. A 429 waits for Telegram's retry_after (returning False until then), and
+        server errors are retried like network errors; neither counts as a refusal.
+        Returns True once the reply is finished with.
+        """
+        progress = self.state.data.get("reply_delivery")
+        if not isinstance(progress, dict) or progress.get("cursor") != reply_cursor \
+                or not isinstance(progress.get("parts"), int) \
+                or not isinstance(progress.get("failures"), int):
+            progress = {"cursor": reply_cursor, "parts": 0, "failures": 0}
+        retry_at = progress.get("retry_at")
+        if isinstance(retry_at, (int, float)) and time.time() < retry_at:
+            return False
+
+        def record(**change: float) -> None:
+            progress.update(change)
+            self.state.data["reply_delivery"] = dict(progress)  # save() replaces state.data.
+            self.state.save()
+
+        def sent(parts: int) -> None:
+            record(parts=parts, failures=0)
+
+        source = (self.state.data.get("telegram_note_messages") or {}).get(reply.get("id"))
+        thread = source.get("thread_id") if isinstance(source, dict) else None
+        # In a topic: same topic, quoting the question.
+        target = (source.get("message_id"), thread) if isinstance(thread, int) else (None, None)
+        try:
+            self.send(str(reply.get("body", "")), *target, start=progress["parts"], sent=sent)
+        except TelegramAPIError as exc:
+            if exc.code == 429:
+                wait = min(exc.retry_after or 1.0, MAX_RETRY_AFTER_SECONDS)
+                self.log.warning("Telegram asked to wait %.0f s before the rest of the reply "
+                                 "to note id=%s", wait, reply.get("id"))
+                record(retry_at=time.time() + wait)
+                return False
+            if not exc.content_refusal:
+                raise
+            record(failures=progress["failures"] + 1)
+            if progress["failures"] < MAX_REPLY_ATTEMPTS:
+                raise
+            self.log.warning("Telegram refused part %d of the reply to note id=%s %d times; "
+                             "skipping the rest", progress["parts"] + 1, reply.get("id"),
+                             progress["failures"])
+            try:
+                self.send("⚠️ Part of the reply to note %s could not be delivered to Telegram. "
+                          "Read it on the machine with fm-inbox.sh." % reply.get("id"), *target)
+            except TelegramAPIError:
+                self.log.warning("the notice for note id=%s was refused too", reply.get("id"))
+        return True
 
     def _take_over(self) -> None:
         """Heartbeat the standby and handle what it queued while this primary was away."""
@@ -2052,9 +2287,9 @@ class Bridge:
         try:
             for update in claim["updates"]:
                 try:
-                    self.process_update(update)
+                    self._process_bounded(update)
                 except TelegramAPIError:
-                    # E.g. a callback too old to answer; its note was recorded first.
+                    # E.g. a receipt Telegram refused; its note was recorded first.
                     self.log.warning("queued update id=%d not fully processed", update["update_id"])
         except Exception:
             self.failover.last = None  # Retry the queue before the next poll: keep the order.
@@ -2069,9 +2304,56 @@ class Bridge:
     def poll_updates(self) -> None:
         offset = int(self.state.data.get("offset", 0))
         for update in self.api.updates(offset):
-            self.process_update(update)
+            self._process_bounded(update)
             self.state.data["offset"] = int(update["update_id"]) + 1
             self.state.save()
+
+    def _process_bounded(self, update: dict[str, Any]) -> None:
+        """process_update, giving up on one update after MAX_UPDATE_ATTEMPTS failures.
+
+        A failure is retried on the next polls (run() backs off). An update that keeps
+        failing is replaced by a short note, so it cannot hold back every later message;
+        if even that note cannot be written, the update stays and is retried as before.
+        """
+        update_id = update.get("update_id")
+        if update_id in self.state.data.get("handled_update_ids", []):
+            return  # Including one skipped here earlier and then redelivered.
+        try:
+            self.process_update(update)
+        except Exception as exc:
+            if not isinstance(update_id, int) or isinstance(update_id, bool):
+                raise
+            failures = self.state.data.get("update_failures")
+            failures = dict(failures) if isinstance(failures, dict) else {}
+            attempts = int(failures.get(str(update_id)) or 0) + 1
+            name = type(exc).__name__
+            self.log.warning("update id=%d failed (%s), attempt %d of %d", update_id, name,
+                             attempts, MAX_UPDATE_ATTEMPTS)
+            if attempts < MAX_UPDATE_ATTEMPTS:
+                failures.pop(str(update_id), None)
+                failures[str(update_id)] = attempts
+                # Keep only recent entries: an update can also expire on Telegram's side.
+                self.state.data["update_failures"] = dict(list(failures.items())[-20:])
+                self.state.save()
+                if isinstance(exc, (RuntimeError, OSError)):
+                    raise
+                raise RuntimeError("update id=%d could not be processed (%s)"
+                                   % (update_id, name)) from exc
+            self._skip_update(update, name)
+        else:
+            failures = self.state.data.get("update_failures")
+            if not (isinstance(failures, dict) and str(update_id) in failures):
+                return
+        failures = dict(self.state.data.get("update_failures") or {})
+        failures.pop(str(update_id), None)
+        self.state.data["update_failures"] = failures
+        self.state.save()
+
+    def _skip_update(self, update: dict[str, Any], error: str) -> None:
+        """Tell Firstmate that an update arrived but could not be processed."""
+        self._submit(update["update_id"], "(message could not be processed: %s)" % error,
+                     "Could not process that message (%s). Only the fact that it arrived was "
+                     "sent as note %%s." % error)
 
     def once(self) -> None:
         self._expire_choices()
@@ -2173,9 +2455,17 @@ class Standby(Bridge):
         self._mark_handled(update_id)
         if isinstance(callback, dict):
             if isinstance(callback.get("id"), str):
-                self.api.answer_callback(callback["id"], self.reply[:200])
+                self._answer_callback(callback["id"], self.reply[:200])
         else:
             self.send(self.reply)
+
+    def _skip_update(self, update: dict[str, Any], error: str) -> None:
+        """The standby has no inbox of its own: queue the update for the primary unchanged."""
+        def add(updates: list[Any]) -> None:
+            if all(item.get("update_id") != update["update_id"] for item in updates):
+                updates.append(update)
+        update_queue(self.state, add)
+        self._mark_handled(update["update_id"])
 
     def deliver(self, route: Route, update: dict[str, Any]) -> Optional[str]:
         """Note a routed message in the home it belongs to; return that home's key."""
@@ -2186,7 +2476,7 @@ class Standby(Bridge):
 
     def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
                 message: Optional[dict[str, Any]] = None) -> None:
-        note = self.inbox.note("tg:%d" % update_id, text)
+        note = self.inbox.note("tg:%d" % update_id, _note_body(text))
         note_id = note if isinstance(note, str) else note.id  # str: an Inbox test double.
         self._mark_handled(update_id)
         message_id = (message or {}).get("message_id")
@@ -2369,8 +2659,11 @@ class Setup:
                  ask: Callable[[str], str] = input,
                  interactive: Optional[bool] = None, platform: str = sys.platform,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 pairing_code: Callable[[], str] = lambda: "%06d" % secrets.randbelow(10 ** 6)
+                 ) -> None:
         self.args, self.out = args, out or sys.stdout
+        self.pairing_code = pairing_code
         self.api_factory, self.runner, self.secret, self.ask = api_factory, runner, secret, ask
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.platform, self.clock, self.sleep = platform, clock, sleep
@@ -2508,13 +2801,17 @@ class Setup:
     def detect_owner(self, api: Any, bot: str) -> int:
         if not self.interactive and not self.args.yes:
             raise NeedsHuman("owner", "owner_chat_id is not set. Run setup in a terminal, or "
-                             "add --yes to accept the first private message to @%s" % bot)
+                             "add --yes to accept the private chat that sends @%s the pairing "
+                             "code setup prints" % bot)
         try:
             # Skip the backlog: only a message sent now shows who is setting this bot up.
             backlog = api.call("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}) or []
             offset = max((item["update_id"] for item in backlog), default=-1) + 1
-            self.step("owner", "need-human", "send any message to @%s from your own Telegram "
-                      "account, in a private chat (waiting %ds)" % (bot, self.args.wait))
+            # Anyone who finds the bot can message it during the wait; only the person who
+            # can read this output knows the one-time code.
+            code = self.pairing_code()
+            self.step("owner", "need-human", "send the code %s to @%s from your own Telegram "
+                      "account, in a private chat (waiting %ds)" % (code, bot, self.args.wait))
             deadline = self.clock() + self.args.wait
             while self.clock() < deadline:
                 timeout = max(0, min(30, int(deadline - self.clock())))
@@ -2526,6 +2823,11 @@ class Setup:
                     if chat.get("type") != "private" or not isinstance(chat.get("id"), int):
                         self.step("owner", "skip", "ignored a message from a %s chat; only a "
                                   "private chat can own the bridge" % chat.get("type", "unknown"))
+                        continue
+                    text = (item.get("message") or {}).get("text")
+                    if not isinstance(text, str) or text.strip() != code:
+                        self.step("owner", "skip", "ignored a private message without the "
+                                  "pairing code")
                         continue
                     who = " ".join(part for part in (chat.get("first_name"), chat.get("last_name"))
                                    if part) or "?"
@@ -2544,8 +2846,8 @@ class Setup:
                 raise RuntimeError("Telegram reports another reader of this bot (a running "
                                    "bridge or a webhook); stop it and run setup again") from None
             raise
-        raise NeedsHuman("owner", "no private message reached @%s in %ds; send one and run "
-                         "setup again" % (bot, self.args.wait))
+        raise NeedsHuman("owner", "no private message with the pairing code reached @%s in %ds; "
+                         "run setup again for a new code" % (bot, self.args.wait))
 
     def check_voice(self, config: dict[str, Any]) -> None:
         if self.platform != "darwin":
