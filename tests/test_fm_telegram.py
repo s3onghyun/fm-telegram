@@ -540,6 +540,28 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual("finished", self.api.sent[-1][1])
         self.assertEqual(["note-tg:48"], self.state.data["telegram_completed_note_ids"])
 
+    def test_reply_resumes_after_the_delivered_parts(self):
+        self.state.data["telegram_note_ids"] = ["ours"]
+        body = "a" * 4000 + "\n\n" + "b" * 4000 + "\n\n" + "c" * 200
+        self.inbox.reply_rows = [{"id": "ours", "body": body, "cursor": "000000000001"}]
+        send, calls = self.api.send, []
+
+        def flaky(chat_id, text, **kwargs):
+            calls.append(text)
+            if text.startswith("b") and calls.count(text) == 1:
+                raise RuntimeError("Telegram network request failed")
+            return send(chat_id, text, **kwargs)
+        self.api.send = flaky
+        with self.assertRaises(RuntimeError):
+            self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0},
+                         self.state.data["reply_delivery"])
+        restarted = fm.Bridge(self.api, self.inbox, fm.State(self.state.directory), OWNER,
+                              fm.Redactor(), self.bridge.log)
+        restarted.check_replies()
+        self.assertEqual([text[0] for _chat, text in self.api.sent], ["a", "b", "c"])
+        self.assertEqual("000000000001", restarted.state.data["receipt_cursor"])
+
     def test_splitting_and_redaction(self):
         self.bridge.send("ghp_abcdefghijklmnop " + "x" * 5000)
         self.assertGreaterEqual(len(self.api.sent), 2)
@@ -786,6 +808,56 @@ class FormattingTests(unittest.TestCase):
         )
         self.assertEqual('<code>a &lt; b &amp; c</code> <a href="https://example.com?a=1&amp;b=2">문서</a> '
                          '&lt;script&gt;', rendered)
+
+    def assert_well_formed(self, parts, html):
+        self.assertLessEqual(len(parts), len(html) // fm.TELEGRAM_LIMIT + 2)
+        for part in parts:
+            self.assertLessEqual(len(part), fm.TELEGRAM_LIMIT)
+            stack = []
+            for tag in fm.HTML_TAG.findall(part):
+                if tag.startswith("</"):
+                    self.assertEqual(stack.pop() if stack else None, fm._tag_name(tag), part[:200])
+                else:
+                    stack.append(fm._tag_name(tag))
+            self.assertEqual([], stack, part[:200])
+
+    def test_emphasis_is_always_nested(self):
+        self.assertEqual("<b>a *b</b> c*", fm.markdown_to_telegram_html("**a *b** c*"))
+        self.assertEqual("<i>a <b>b</b> c</i>", fm.markdown_to_telegram_html("*a **b** c*"))
+        self.assertEqual("<b><i>x</i> <code>*y*</code></b>",
+                         fm.markdown_to_telegram_html("**_x_ `*y*`**"))
+        self.assertEqual("<b>*</b>", fm.markdown_to_telegram_html("*****"))
+
+    def test_parts_never_exceed_the_limit_at_a_boundary(self):
+        for text in ("x" * 4096 + " y", "x" * 4095 + "\n\ny", "x" * 4094 + "\n\ny"):
+            parts = fm.split_telegram_html(fm.markdown_to_telegram_html(text))
+            self.assertEqual(2, len(parts), text[-5:])
+            self.assertTrue(all(len(part) <= fm.TELEGRAM_LIMIT for part in parts))
+            self.assertEqual(text, "".join(parts))
+
+    def test_emphasis_runs_split_into_few_parts(self):
+        for marker in "*_":
+            for count in (5000, 20480):
+                html = fm.markdown_to_telegram_html(marker * count)
+                parts = fm.split_telegram_html(html)
+                self.assert_well_formed(parts, html)
+                self.assertLessEqual(len(parts), 3 if count == 5000 else 9)
+
+    def test_random_markdown_splits_within_the_limit_and_nested(self):
+        import random
+        rng = random.Random(7)
+        words = ["word", "**bold", "it*", "_u_", "__", "*", "**", "&", "<b>", "가나다",
+                 "[l](https://example.com/a?b=1&c=2)", "`c`", "\n", "\n\n", "x" * 300]
+        for _round in range(500):
+            text = " ".join(rng.choice(words) for _ in range(rng.randint(1, 3000)))
+            html = fm.markdown_to_telegram_html(text[:fm.MAX_OUTBOUND_CHARS])
+            self.assert_well_formed(fm.split_telegram_html(html), html)
+
+    def test_unsplittable_html_falls_back_to_escaped_plain_text(self):
+        html = '<a href="https://example.com/%s">a &amp; b</a>' % ("x" * 5000)
+        self.assertEqual(["a &amp; b"], fm.split_telegram_html(html))
+        self.assertEqual(["x"], fm.split_telegram_html("x</b></i>"))
+        self.assertEqual([], fm.split_telegram_html("<b> </b>"))
 
     def test_long_html_is_split_at_safe_boundaries(self):
         rendered = fm.markdown_to_telegram_html("**" + ("가나다 " * 1200) + "**")

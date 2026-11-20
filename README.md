@@ -184,7 +184,7 @@ python3 ~/.local/share/fm-telegram/fm_telegram.py notify 'Button delivery check'
   --choice '1:b=Received'
 ```
 
-Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries, and if Telegram rejects the formatting the same part is resent as plain text. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
+Replies render a small Markdown subset as Telegram HTML: `**bold**`, `*italic*`, inline and fenced code, `https://` links and bullet lists; Markdown tables become `• column: value` lines. Any other `<`, `>` and `&` is escaped. Long replies are split at paragraph or line boundaries into parts within Telegram's 4096-character limit, and if Telegram rejects the formatting the same part is resent as plain text. A reply part Telegram keeps refusing is retried on the next polls without resending the parts already delivered; after three refusals the rest of that reply is replaced by a short notice, so later replies are not held back. See [reply style](docs/reply-style.md) and [readability research](docs/readability-research.md).
 
 ## Configuration
 

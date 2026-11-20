@@ -83,6 +83,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Bot API getFile download limit.
+MAX_REPLY_ATTEMPTS = 3  # Refusals of the same reply part before the rest of it is skipped.
 DOORBELL_COOLDOWN_SECONDS = 20.0
 NOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 CHOICE_SPEC = re.compile(r"([A-Za-z0-9_-]{1,16}):([A-Za-z0-9_-]{1,16})=(.+)")
@@ -156,6 +157,17 @@ def _inline_html(value: str) -> str:
         saved.append(rendered)
         return marker
 
+    def restore(text: str) -> str:
+        return re.sub(r"\x00TG(\d+)\x00", lambda match: saved[int(match.group(1))], text)
+
+    def italic(text: str) -> str:
+        text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+        return re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+
+    def bold(match: re.Match[str]) -> str:
+        # Saved whole, so the italic pass over the rest never sees half of a bold span.
+        return save(restore("<b>%s</b>" % italic(match.group(1))))
+
     def code(match: re.Match[str]) -> str:
         return save("<code>%s</code>" % html.escape(match.group(1)))
 
@@ -169,14 +181,11 @@ def _inline_html(value: str) -> str:
     value = re.sub(r"`([^`\n]+)`", code, value)
     value = re.sub(r"\[([^\]\n]+)\]\(([^)\s]+)\)", link, value)
     value = html.escape(value)
-    # The deliberate ordering makes bold markers disappear before italic markers.
-    value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
-    value = re.sub(r"__(.+?)__", r"<b>\1</b>", value)
-    value = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", value)
-    value = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", value)
-    for index, rendered in enumerate(saved):
-        value = value.replace("\x00TG%d\x00" % index, rendered)
-    return value
+    # Bold first, so its markers disappear before the italic pass; italics inside a bold
+    # span are rendered within it, which keeps the tags nested.
+    value = re.sub(r"\*\*(.+?)\*\*", bold, value)
+    value = re.sub(r"__(.+?)__", bold, value)
+    return restore(italic(value))
 
 
 def _table_cells(line: str) -> list[str]:
@@ -242,23 +251,44 @@ def markdown_to_telegram_html(text: str) -> str:
 
 
 def _safe_text_cut(value: str, maximum: int) -> int:
-    """Prefer paragraph/line/word boundaries and never split an HTML entity."""
+    """Prefer paragraph/line/word boundaries and never split an HTML entity.
+
+    The cut is at most maximum. A boundary in the last quarter wins, so no part is
+    needlessly short; without one, the last boundary anywhere (or maximum) is used.
+    """
     if len(value) <= maximum:
         return len(value)
-    candidates = (value.rfind("\n\n", 0, maximum + 1), value.rfind("\n", 0, maximum + 1),
-                  value.rfind(" ", 0, maximum + 1))
-    cut = next((point + (2 if point == candidates[0] else 1)
-                for point in candidates if point > 0), maximum)
+    window = value[:maximum + 1]
+    found = [(window.rfind(separator), len(separator)) for separator in ("\n\n", "\n", " ")]
+    late = [(point, size) for point, size in found if point >= maximum * 3 // 4]
+    point, size = next(iter(late or sorted(found, reverse=True)))
+    cut = min(point + size, maximum) if point > 0 else maximum
     ampersand = value.rfind("&", 0, cut)
     if ampersand >= 0 and ";" not in value[ampersand:cut]:
         cut = ampersand
     return cut
 
 
-def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """Split generated Telegram HTML without breaking a tag or leaving it unbalanced."""
-    if limit < 32:
-        raise ValueError("Telegram HTML limit is too small")
+def _text_parts(value: str, limit: int, boundaries: bool = True) -> list[str]:
+    """Split escaped text that holds no tags into parts of at most limit characters."""
+    parts = []
+    while value:
+        cut = _safe_text_cut(value, limit) if boundaries else min(len(value), limit)
+        if not boundaries and cut < len(value):
+            ampersand = value.rfind("&", 0, cut)
+            if ampersand > 0 and ";" not in value[ampersand:cut]:
+                cut = ampersand
+        cut = cut or min(len(value), limit)
+        parts.append(value[:cut])
+        value = value[cut:]
+    return parts
+
+
+class _SplitFailed(Exception):
+    """The generated HTML cannot be split within the limit; fall back to plain text."""
+
+
+def _split_html(value: str, limit: int) -> list[str]:
     tokens = re.split(r"(<[^>]+>)", value)
     result: list[str] = []
     open_tags: list[tuple[str, str]] = []
@@ -268,39 +298,46 @@ def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     def closers() -> str:
         return "".join("</%s>" % name for name, _tag in reversed(open_tags))
 
+    def size() -> int:
+        return len(prefix) + len(current) + len(closers())
+
     def flush() -> None:
         nonlocal prefix, current
-        if current:
-            result.append(prefix + current + closers())
+        if not current:
+            raise _SplitFailed()  # Even an empty part has no room: give up, never loop.
+        result.append(prefix + current + closers())
         prefix = "".join(tag for _name, tag in open_tags)
         current = ""
 
     for token in tokens:
         if not token:
             continue
+        if token.startswith("</"):
+            name = _tag_name(token)
+            names = [open_name for open_name, _tag in open_tags]
+            if name not in names:
+                continue  # A closer with nothing to close would make Telegram reject the part.
+            # Close any tag opened after the matching one too, so the output stays nested.
+            # Their closers were already counted in size(), so this never adds length.
+            while open_tags[-1][0] != name:
+                current += "</%s>" % open_tags.pop()[0]
+            open_tags.pop()
+            current += token
+            continue
         if token.startswith("<"):
             name = _tag_name(token)
-            if token.startswith("</"):
-                if len(prefix) + len(current) + len(token) + len(closers()) <= limit:
-                    current += token
-                else:
-                    flush()
-                    current += token
-                if name and open_tags and open_tags[-1][0] == name:
-                    open_tags.pop()
-            else:
-                if len(prefix) + len(current) + len(token) + len(closers()) > limit:
-                    flush()
-                current += token
-                if name and not token.endswith("/>"):
-                    open_tags.append((name, token))
+            closer = len("</%s>" % name) if name and not token.endswith("/>") else 0
+            if size() + len(token) + closer > limit:
+                flush()
+                if size() + len(token) + closer > limit:
+                    raise _SplitFailed()
+            current += token
+            if closer:
+                open_tags.append((name, token))
             continue
         while token:
-            space = limit - len(prefix) - len(current) - len(closers())
-            if space <= 0:
-                flush()
-                continue
-            cut = _safe_text_cut(token, space)
+            space = limit - size()
+            cut = _safe_text_cut(token, space) if space > 0 else 0
             if cut == 0:
                 flush()
                 continue
@@ -308,8 +345,32 @@ def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
             token = token[cut:]
             if token:
                 flush()
-    flush()
+    if current:
+        flush()
     return result
+
+
+def split_telegram_html(value: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    """Split generated Telegram HTML without breaking a tag or leaving it unbalanced.
+
+    Every part is at most limit characters and well nested, and there are at most
+    len(value) // limit + 2 parts. Input the splitter cannot honour that for is sent
+    as escaped plain text instead.
+    """
+    if limit < 32:
+        raise ValueError("Telegram HTML limit is too small")
+    most = len(value) // limit + 2
+    try:
+        parts = _split_html(value, limit)
+    except _SplitFailed:
+        parts = []
+    if not (parts and len(parts) <= most and all(len(part) <= limit for part in parts)):
+        plain = html.escape(_plain_html(value), quote=False)
+        parts = _text_parts(plain, limit)
+        if len(parts) > most:
+            parts = _text_parts(plain, limit, boundaries=False)
+    # Telegram refuses a message with no visible text.
+    return [part for part in parts if _plain_html(part).strip()]
 
 
 class Redactor:
@@ -1540,14 +1601,18 @@ class Bridge:
                              **({"reply_markup": reply_markup} if reply_markup else {}))
 
     def send(self, text: str, reply_to_message_id: Optional[int] = None,
-             thread_id: Optional[int] = None) -> None:
+             thread_id: Optional[int] = None, start: int = 0,
+             sent: Optional[Callable[[int], None]] = None) -> None:
+        """Send text as one or more parts, from part number start; sent(n) follows each."""
         if len(text) > MAX_OUTBOUND_CHARS:
             text = text[:MAX_OUTBOUND_CHARS] + "\n… (truncated)"
         redacted = self.redactor.redact(text)
         if not redacted:
             return
         formatted = markdown_to_telegram_html(redacted)
-        for part in split_telegram_html(formatted):
+        for number, part in enumerate(split_telegram_html(formatted)):
+            if number < start:
+                continue  # Delivered by an earlier attempt.
             # Telegram permits considerably more than this, but a modest local cap
             # keeps a long reply from becoming a burst of outbound API requests.
             remaining = 0.05 - (time.monotonic() - self._last_send)
@@ -1555,6 +1620,8 @@ class Bridge:
                 time.sleep(remaining)
             self._post(part, thread_id, reply_to_message_id)
             self._last_send = time.monotonic()
+            if sent:
+                sent(number + 1)
 
     def _expire_choices(self) -> bool:
         cutoff = time.time() - CHOICE_TTL_SECONDS
@@ -2018,21 +2085,57 @@ class Bridge:
         for reply in receipts.get("replies", []):
             reply_cursor = str(reply.get("cursor", ""))
             if reply.get("id") in known:
-                source = (self.state.data.get("telegram_note_messages") or {}).get(reply.get("id"))
-                thread = source.get("thread_id") if isinstance(source, dict) else None
-                if isinstance(thread, int):  # In a topic: same topic, quoting the question.
-                    self.send(str(reply.get("body", "")), source.get("message_id"), thread)
-                else:
-                    self.send(str(reply.get("body", "")))
+                self._deliver_reply(reply, reply_cursor)
                 # A published reply completes the note; setMessageReaction replaces 👀.
                 self._react_once(reply.get("id"), "telegram_completed_note_ids", DONE_REACTION)
             # All receipts are consumed to avoid permanent re-polling of unrelated replies.
             cursor = reply_cursor or cursor
             self.state.data["receipt_cursor"] = cursor
+            self.state.data.pop("reply_delivery", None)
             self.state.save()
         if not receipts.get("replies") and receipts.get("reply_cursor"):
             self.state.data["receipt_cursor"] = str(receipts["reply_cursor"])
             self.state.save()
+
+    def _deliver_reply(self, reply: dict[str, Any], reply_cursor: str) -> None:
+        """Send one reply, resuming after the parts an earlier attempt delivered.
+
+        A part Telegram keeps refusing is retried on the next polls; after
+        MAX_REPLY_ATTEMPTS refusals in a row the rest of the reply is replaced by a short
+        notice, so one bad reply never repeats itself or holds back the replies after it.
+        """
+        progress = self.state.data.get("reply_delivery")
+        if not isinstance(progress, dict) or progress.get("cursor") != reply_cursor \
+                or not isinstance(progress.get("parts"), int) \
+                or not isinstance(progress.get("failures"), int):
+            progress = {"cursor": reply_cursor, "parts": 0, "failures": 0}
+
+        def record(**change: int) -> None:
+            progress.update(change)
+            self.state.data["reply_delivery"] = dict(progress)  # save() replaces state.data.
+            self.state.save()
+
+        def sent(parts: int) -> None:
+            record(parts=parts, failures=0)
+
+        source = (self.state.data.get("telegram_note_messages") or {}).get(reply.get("id"))
+        thread = source.get("thread_id") if isinstance(source, dict) else None
+        # In a topic: same topic, quoting the question.
+        target = (source.get("message_id"), thread) if isinstance(thread, int) else (None, None)
+        try:
+            self.send(str(reply.get("body", "")), *target, start=progress["parts"], sent=sent)
+        except TelegramAPIError:
+            record(failures=progress["failures"] + 1)
+            if progress["failures"] < MAX_REPLY_ATTEMPTS:
+                raise
+            self.log.warning("Telegram refused part %d of the reply to note id=%s %d times; "
+                             "skipping the rest", progress["parts"] + 1, reply.get("id"),
+                             progress["failures"])
+            try:
+                self.send("⚠️ Part of the reply to note %s could not be delivered to Telegram. "
+                          "Read it on the machine with fm-inbox.sh." % reply.get("id"), *target)
+            except TelegramAPIError:
+                self.log.warning("the notice for note id=%s was refused too", reply.get("id"))
 
     def _take_over(self) -> None:
         """Heartbeat the standby and handle what it queued while this primary was away."""
