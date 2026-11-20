@@ -85,6 +85,7 @@ TELEGRAM_LIMIT = 4096
 MAX_OUTBOUND_CHARS = 5 * TELEGRAM_LIMIT  # Bounds one notify/reply to a handful of messages.
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Bot API getFile download limit.
 MAX_REPLY_ATTEMPTS = 3  # Refusals of the same reply part before the rest of it is skipped.
+MAX_RETRY_AFTER_SECONDS = 300.0  # Longest wait honoured from a Telegram 429 retry_after.
 MAX_UPDATE_ATTEMPTS = 3  # Failed attempts at one update before it is noted and skipped.
 DOORBELL_COOLDOWN_SECONDS = 20.0
 NOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
@@ -129,9 +130,23 @@ LIST_ITEM = re.compile(r"^(\s*)(?:[-+*]|\d+[.)])\s+(.*)$")
 
 class TelegramAPIError(RuntimeError):
     """A response from Telegram was valid HTTP but rejected the message."""
-    def __init__(self, message: str, code: Optional[int] = None) -> None:
+    def __init__(self, message: str, code: Optional[int] = None,
+                 retry_after: Optional[float] = None) -> None:
         super().__init__(message)
         self.code = code  # 409 means another getUpdates poller is running.
+        self.retry_after = retry_after  # Seconds Telegram asks to wait (HTTP 429).
+
+    @property
+    def content_refusal(self) -> bool:
+        """Telegram refused the request itself, not a rate limit or a server failure."""
+        return self.code is not None and 400 <= self.code < 500 and self.code != 429
+
+
+def _retry_after(body: Any) -> Optional[float]:
+    value = ((body.get("parameters") if isinstance(body, dict) else None) or {}).get("retry_after")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
 
 
 class AttachmentTooLarge(RuntimeError):
@@ -542,13 +557,21 @@ class TelegramAPI:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             # Telegram reports rejections (bad entities, 401, 409, 429) as HTTP 4xx.
-            exc.close()
+            try:
+                error = json.loads(exc.read(65536).decode("utf-8"))
+            except (AttributeError, OSError, ValueError):
+                error = None
+            finally:
+                exc.close()
             raise TelegramAPIError("Telegram API rejected request (HTTP %d)" % exc.code,
-                                   exc.code) from None
+                                   exc.code, _retry_after(error)) from None
         except (URLError, OSError, ValueError) as exc:
             raise RuntimeError("Telegram network request failed") from exc
         if not body.get("ok"):
-            raise TelegramAPIError("Telegram API rejected request")
+            code = body.get("error_code")
+            raise TelegramAPIError("Telegram API rejected request",
+                                   code if isinstance(code, int) and not isinstance(code, bool)
+                                   else None, _retry_after(body))
         return body.get("result")
 
     def updates(self, offset: int) -> list[dict[str, Any]]:
@@ -1832,39 +1855,39 @@ class Bridge:
         parts = data.split(":") if isinstance(data, str) else []
         if len(parts) != 4 or parts[0] != "fmchoice":
             self.log.warning("unknown Telegram callback format")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         request_id, question_id, option_id = parts[1:]
         pending = self.state.choices().get(request_id)
         if not isinstance(pending, dict):
             self.log.warning("unknown Telegram choice callback")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         if message.get("message_id") != pending.get("message_id"):
             self.log.warning("unknown Telegram choice callback message")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         question = next((item for item in pending.get("questions", [])
                          if item.get("id") == question_id), None)
         if not isinstance(question, dict):
             self.log.warning("unknown Telegram choice question")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         option = next((item for item in question.get("options", [])
                        if item.get("id") == option_id), None)
         if not isinstance(option, dict):
             self.log.warning("unknown Telegram choice option")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         selected = pending.get("selected", {})
         if not isinstance(selected, dict):
             selected = {}
         if question_id in selected:
-            self.api.answer_callback(callback_id, "이미 받았어요")
+            self._answer_callback(callback_id, "이미 받았어요")
             return
         if not NOTE_ID.fullmatch(callback_id):
             self.log.warning("ignored Telegram callback with unsafe id")
-            self.api.answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
+            self._answer_callback(callback_id, "만료된 선택이에요, 텍스트로 답해 주세요")
             return
         body = "Decision reply to %s: %s%s\nQuestion: %s\nSelected: %s" % (
             request_id, question_id, option_id, question["text"], option["label"])
@@ -1872,7 +1895,7 @@ class Bridge:
             note = self.inbox.note("tg:callback:" + callback_id, body)
         except (OSError, RuntimeError):
             self.log.warning("failed to record Telegram choice callback")
-            self.api.answer_callback(callback_id, "처리하지 못했어요, 다시 눌러 주세요")
+            self._answer_callback(callback_id, "처리하지 못했어요, 다시 눌러 주세요")
             raise
         if isinstance(note, str):
             note = Note(note)
@@ -1895,14 +1918,24 @@ class Bridge:
 
         chosen = self.state.update_choices(select)
         if not isinstance(chosen, dict):
-            self.api.answer_callback(callback_id, "이미 받았어요")
+            self._answer_callback(callback_id, "이미 받았어요")
             return
         self.state.save()
-        self.api.answer_callback(callback_id, "받았어요 ✓ %s%s" % (question_id, option_id))
+        self._answer_callback(callback_id, "받았어요 ✓ %s%s" % (question_id, option_id))
         message_id = chosen.get("message_id")
         if isinstance(message_id, int):
-            self.api.edit_reply_markup(self.owner_chat_id, message_id,
-                                       self._choice_markup(chosen))
+            try:
+                self.api.edit_reply_markup(self.owner_chat_id, message_id,
+                                           self._choice_markup(chosen))
+            except TelegramAPIError:
+                self.log.warning("Telegram refused to update the choice buttons")
+
+    def _answer_callback(self, callback_id: str, text: str) -> None:
+        """Acknowledge a button press; Telegram refuses this for an old one."""
+        try:
+            self.api.answer_callback(callback_id, text)
+        except TelegramAPIError:
+            self.log.warning("Telegram refused to answer a choice callback")
 
     def process_update(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -2168,7 +2201,8 @@ class Bridge:
         for reply in receipts.get("replies", []):
             reply_cursor = str(reply.get("cursor", ""))
             if reply.get("id") in known:
-                self._deliver_reply(reply, reply_cursor)
+                if not self._deliver_reply(reply, reply_cursor):
+                    break  # Telegram asked to wait; this reply is retried after that.
                 # A published reply completes the note; setMessageReaction replaces 👀.
                 self._react_once(reply.get("id"), "telegram_completed_note_ids", DONE_REACTION)
             # All receipts are consumed to avoid permanent re-polling of unrelated replies.
@@ -2180,20 +2214,26 @@ class Bridge:
             self.state.data["receipt_cursor"] = str(receipts["reply_cursor"])
             self.state.save()
 
-    def _deliver_reply(self, reply: dict[str, Any], reply_cursor: str) -> None:
+    def _deliver_reply(self, reply: dict[str, Any], reply_cursor: str) -> bool:
         """Send one reply, resuming after the parts an earlier attempt delivered.
 
-        A part Telegram keeps refusing is retried on the next polls; after
-        MAX_REPLY_ATTEMPTS refusals in a row the rest of the reply is replaced by a short
-        notice, so one bad reply never repeats itself or holds back the replies after it.
+        A part Telegram keeps refusing (HTTP 4xx other than 429) is retried on the next
+        polls; after MAX_REPLY_ATTEMPTS refusals in a row the rest of the reply is replaced
+        by a short notice, so one bad reply never repeats itself or holds back the replies
+        after it. A 429 waits for Telegram's retry_after (returning False until then), and
+        server errors are retried like network errors; neither counts as a refusal.
+        Returns True once the reply is finished with.
         """
         progress = self.state.data.get("reply_delivery")
         if not isinstance(progress, dict) or progress.get("cursor") != reply_cursor \
                 or not isinstance(progress.get("parts"), int) \
                 or not isinstance(progress.get("failures"), int):
             progress = {"cursor": reply_cursor, "parts": 0, "failures": 0}
+        retry_at = progress.get("retry_at")
+        if isinstance(retry_at, (int, float)) and time.time() < retry_at:
+            return False
 
-        def record(**change: int) -> None:
+        def record(**change: float) -> None:
             progress.update(change)
             self.state.data["reply_delivery"] = dict(progress)  # save() replaces state.data.
             self.state.save()
@@ -2207,7 +2247,15 @@ class Bridge:
         target = (source.get("message_id"), thread) if isinstance(thread, int) else (None, None)
         try:
             self.send(str(reply.get("body", "")), *target, start=progress["parts"], sent=sent)
-        except TelegramAPIError:
+        except TelegramAPIError as exc:
+            if exc.code == 429:
+                wait = min(exc.retry_after or 1.0, MAX_RETRY_AFTER_SECONDS)
+                self.log.warning("Telegram asked to wait %.0f s before the rest of the reply "
+                                 "to note id=%s", wait, reply.get("id"))
+                record(retry_at=time.time() + wait)
+                return False
+            if not exc.content_refusal:
+                raise
             record(failures=progress["failures"] + 1)
             if progress["failures"] < MAX_REPLY_ATTEMPTS:
                 raise
@@ -2219,6 +2267,7 @@ class Bridge:
                           "Read it on the machine with fm-inbox.sh." % reply.get("id"), *target)
             except TelegramAPIError:
                 self.log.warning("the notice for note id=%s was refused too", reply.get("id"))
+        return True
 
     def _take_over(self) -> None:
         """Heartbeat the standby and handle what it queued while this primary was away."""
@@ -2240,7 +2289,7 @@ class Bridge:
                 try:
                     self._process_bounded(update)
                 except TelegramAPIError:
-                    # E.g. a callback too old to answer; its note was recorded first.
+                    # E.g. a receipt Telegram refused; its note was recorded first.
                     self.log.warning("queued update id=%d not fully processed", update["update_id"])
         except Exception:
             self.failover.last = None  # Retry the queue before the next poll: keep the order.
@@ -2406,7 +2455,7 @@ class Standby(Bridge):
         self._mark_handled(update_id)
         if isinstance(callback, dict):
             if isinstance(callback.get("id"), str):
-                self.api.answer_callback(callback["id"], self.reply[:200])
+                self._answer_callback(callback["id"], self.reply[:200])
         else:
             self.send(self.reply)
 

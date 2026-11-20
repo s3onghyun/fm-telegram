@@ -657,6 +657,88 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([text[0] for _chat, text in self.api.sent], ["a", "b", "c"])
         self.assertEqual("000000000001", restarted.state.data["receipt_cursor"])
 
+    def _reply_with_failing_middle_part(self, errors):
+        self.state.data["telegram_note_ids"] = ["ours"]
+        body = "a" * 4000 + "\n\n" + "b" * 4000 + "\n\n" + "c" * 200
+        self.inbox.reply_rows = [{"id": "ours", "body": body, "cursor": "000000000001"}]
+        send, pending = self.api.send, list(errors)
+
+        def flaky(chat_id, text, **kwargs):
+            if text.startswith("b") and pending:
+                raise pending.pop(0)
+            return send(chat_id, text, **kwargs)
+        self.api.send = flaky
+
+    def test_reply_server_errors_do_not_count_as_refusals(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 502)", 502)] * 8
+            + [fm.TelegramAPIError("Telegram API rejected request")] * 2)
+        for _attempt in range(5):
+            with self.assertRaises(fm.TelegramAPIError):
+                self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0},
+                         self.state.data["reply_delivery"])
+        self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual(["a", "b", "c"], [text[0] for text in texts])
+        self.assertFalse(any("could not be delivered" in text for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_reply_waits_for_telegram_retry_after_without_counting_a_refusal(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 429)", 429, 30)] * 2)
+        with patch.object(fm.time, "time", return_value=1000.0):
+            self.bridge.check_replies()
+        self.assertEqual({"cursor": "000000000001", "parts": 1, "failures": 0, "retry_at": 1030.0},
+                         self.state.data["reply_delivery"])
+        self.assertNotIn("receipt_cursor", self.state.data)
+        with patch.object(fm.time, "time", return_value=1029.0):
+            self.bridge.check_replies()
+        self.assertEqual(["a"], [text[0] for _chat, text in self.api.sent])
+        with patch.object(fm.time, "time", return_value=1031.0):
+            self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual(["a", "b", "c"], [text[0] for text in texts])
+        self.assertFalse(any("could not be delivered" in text for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_retry_after_wait_is_capped(self):
+        self._reply_with_failing_middle_part([fm.TelegramAPIError("HTTP 429", 429, 86400)] * 2)
+        with patch.object(fm.time, "time", return_value=1000.0):
+            self.bridge.check_replies()
+        self.assertEqual(1000.0 + fm.MAX_RETRY_AFTER_SECONDS,
+                         self.state.data["reply_delivery"]["retry_at"])
+
+    def test_reply_part_refused_three_times_is_replaced_by_a_notice(self):
+        self._reply_with_failing_middle_part(
+            [fm.TelegramAPIError("Telegram API rejected request (HTTP 400)", 400)] * 6)
+        for _attempt in range(fm.MAX_REPLY_ATTEMPTS - 1):
+            with self.assertRaises(fm.TelegramAPIError):
+                self.bridge.check_replies()
+        self.bridge.check_replies()
+        texts = [text for _chat, text in self.api.sent]
+        self.assertEqual("a", texts[0][0])
+        self.assertIn("could not be delivered", texts[-1])
+        self.assertFalse(any(text.startswith("c") for text in texts))
+        self.assertEqual("000000000001", self.state.data["receipt_cursor"])
+
+    def test_late_button_press_is_recorded_once_when_telegram_refuses_the_answer(self):
+        self.bridge.send_choices("1) Deploy?", fm.parse_choices(["1:y=Yes", "1:n=No"]))
+        request_id = next(iter(self.state.choices()))
+
+        def refuse(*_args):
+            raise fm.TelegramAPIError("Telegram API rejected request (HTTP 400)", 400)
+        self.api.answer_callback = refuse
+        self.api.edit_reply_markup = refuse
+        late = callback_update(200, OWNER, "late-press", "fmchoice:%s:1:y" % request_id)
+        self.api.pending_updates = [late]
+        for _poll in range(fm.MAX_UPDATE_ATTEMPTS + 1):
+            self.bridge.poll_updates()
+        self.assertEqual(["tg:callback:late-press"], [note for note, _body in self.inbox.requests])
+        self.assertEqual("y", self.state.choices()[request_id]["selected"]["1"])
+        self.assertEqual(201, self.state.data["offset"])
+        self.assertFalse(any("Could not process" in text for _chat, text in self.api.sent))
+
     def test_splitting_and_redaction(self):
         self.bridge.send("ghp_abcdefghijklmnop " + "x" * 5000)
         self.assertGreaterEqual(len(self.api.sent), 2)
@@ -782,6 +864,17 @@ class SecurityTests(unittest.TestCase):
             raise fm.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"ok":false}'))
         with self.assertRaises(fm.TelegramAPIError) as caught:
             fm.TelegramAPI(token, opener).send(OWNER, "<b>x", parse_mode="HTML")
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_rate_limit_rejection_carries_retry_after_without_token(self):
+        token = "123456:secret-token"
+        def opener(request, timeout):
+            raise fm.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(
+                b'{"ok":false,"error_code":429,"parameters":{"retry_after":17}}'))
+        with self.assertRaises(fm.TelegramAPIError) as caught:
+            fm.TelegramAPI(token, opener).send(OWNER, "x")
+        self.assertEqual((429, 17.0), (caught.exception.code, caught.exception.retry_after))
         self.assertNotIn(token, str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
 
