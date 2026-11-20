@@ -69,6 +69,10 @@ class Fixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # fm.main defaults --home to FM_HOME; never let a test reach a real Firstmate home.
+        environment = patch.dict(os.environ, {"FM_HOME": self.temp.name})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.server = Server()
         self.routed, self.insta = FakeInbox(), FakeInbox()
         self.standby = self.make_standby()

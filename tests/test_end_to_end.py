@@ -42,6 +42,10 @@ class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        # fm.main defaults --home to FM_HOME; never let a test reach a real Firstmate home.
+        environment = patch.dict(fm.os.environ, {"FM_HOME": self.temp.name})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.server = FakeTelegramServer(TOKEN)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.home = root / "firstmate"
