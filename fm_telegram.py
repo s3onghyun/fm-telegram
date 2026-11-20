@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,12 +95,15 @@ VOICE_KINDS = {"voice": "audio/ogg", "audio": "audio/mpeg", "video": "video/mp4"
 # Structured message fields that are context, not the content the owner sent.
 MESSAGE_CONTEXT = {"from", "chat", "sender_chat", "reply_to_message", "external_reply", "quote",
                    "forward_origin", "entities", "caption_entities", "reply_markup",
-                   "link_preview_options", "via_bot", "sender_business_bot"}
+                   "link_preview_options", "via_bot", "sender_business_bot",
+                   "forward_from", "forward_from_chat"}
 # Fields that carry something the owner sent. A message with none of them is a service
 # message (pin, topic event, title change, video chat, ...) and is ignored, not noted.
 USER_CONTENT = {"text", "caption", "photo", "document", "voice", "audio", "video", "video_note",
                 "animation", "sticker", "contact", "location", "venue", "poll", "dice", "game",
                 "story", "paid_media", "checklist"}
+# C0 and C1 control characters other than tab and newline: never part of what the owner typed.
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 TOKEN_PATTERNS = (
     re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}"),  # Telegram bot token.
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{8,}\b"),
@@ -1349,6 +1353,67 @@ BOT_COMMAND = re.compile(r"/[a-z0-9_]{1,32}")
 ROUTE_EMOJI = "👨‍💻"  # 🖥️ is not a Telegram reaction; 👨‍💻 is the closest allowed one.
 
 
+def _note_body(text: str) -> str:
+    """Remove control characters from a note body (terminal escapes, NUL, ...)."""
+    return CONTROL_CHARACTERS.sub("", text)
+
+
+def _display_name(value: Any) -> str:
+    """A name from Telegram, reduced to one plain line that cannot end the origin marker."""
+    if not isinstance(value, str):
+        return ""
+    value = "".join(" " if character in "[]" or character.isspace() else character
+                    for character in value if unicodedata.category(character) not in {"Cc", "Cf"})
+    return " ".join(value.split())[:64]
+
+
+def _sender(person: Any, kind: str) -> str:
+    """Label a Telegram User or Chat object, e.g. 'user: Ada Lovelace (@ada)'."""
+    person = person if isinstance(person, dict) else {}
+    name = _display_name(person.get("title")) or _display_name(" ".join(
+        part for part in (person.get("first_name"), person.get("last_name")) if isinstance(part, str)))
+    username = _display_name(person.get("username"))
+    label = " ".join(part for part in (name, "(@%s)" % username if username else "") if part)
+    return "%s: %s" % (kind, label or "unknown")
+
+
+def origin_lines(message: dict[str, Any]) -> list[str]:
+    """Marker lines for content the owner did not write: a forward, or a quote of another message.
+
+    The note body is otherwise exactly what arrived, so without these a forwarded stranger's
+    words would read as the owner's own.
+    """
+    lines = []
+    origin = message.get("forward_origin")
+    if isinstance(origin, dict):
+        kind = origin.get("type")
+        if kind == "user":
+            source = _sender(origin.get("sender_user"), "user")
+        elif kind == "hidden_user":
+            source = "user: %s" % (_display_name(origin.get("sender_user_name")) or "unknown")
+        elif kind == "chat":
+            source = _sender(origin.get("sender_chat"), "chat")
+        elif kind == "channel":
+            source = _sender(origin.get("chat"), "channel")
+        else:
+            source = "unknown"
+        lines.append("[forwarded from %s]" % source)
+    elif isinstance(message.get("forward_from"), dict):  # Bot API before 7.0.
+        lines.append("[forwarded from %s]" % _sender(message["forward_from"], "user"))
+    elif isinstance(message.get("forward_from_chat"), dict):
+        lines.append("[forwarded from %s]" % _sender(message["forward_from_chat"], "chat"))
+    elif "forward_sender_name" in message or "forward_date" in message:
+        lines.append("[forwarded from user: %s]"
+                     % (_display_name(message.get("forward_sender_name")) or "unknown"))
+    if isinstance(message.get("quote"), dict) or isinstance(message.get("external_reply"), dict):
+        lines.append("[quoting another message]")
+    return lines
+
+
+def _with_origin(message: dict[str, Any], text: str) -> str:
+    return "\n".join(origin_lines(message) + [text])
+
+
 def _reply_text(message: dict[str, Any]) -> str:
     reply = message.get("reply_to_message")
     reply = reply if isinstance(reply, dict) else {}
@@ -1884,10 +1949,10 @@ class Bridge:
                 note = "(attachment not received: %s — %s)" % (self._describe(message), reason)
                 if isinstance(caption, str) and caption.strip():
                     note += "\n" + caption
-                self._submit(update_id, note, "Could not save that (%s). Only the fact that it "
-                             "arrived was sent as note %%s." % reason, message)
+                self._submit(update_id, _with_origin(message, note), "Could not save that (%s). "
+                             "Only the fact that it arrived was sent as note %%s." % reason, message)
                 return
-            self._submit(update_id, text, message=message)
+            self._submit(update_id, _with_origin(message, text), message=message)
             return
         words = text.split(maxsplit=1)  # Empty for text that is only (Unicode) whitespace.
         command = words[0].split("@", 1)[0] if words else ""
@@ -1908,7 +1973,7 @@ class Bridge:
         if command in DECK_COMMANDS and self.deck:
             self.send(self.deck.text(DECK_COMMANDS[command]), thread_id=thread)
             return
-        self._submit(update_id, text, message=message)
+        self._submit(update_id, _with_origin(message, text), message=message)
 
     def _download(self, update_id: int, message: dict[str, Any]) -> Optional[str]:
         """_attachment_text with one immediate retry for a transient failure."""
@@ -2068,9 +2133,10 @@ class Bridge:
             text = "(%s)" % self._describe(message)
         target = name + ("/%s" % home if isinstance(home, str) else "")
         # Not added to telegram_note_ids, so a reply to this note never reaches Telegram.
-        self.inbox.note("tg:%d" % update_id, "[FYI routed-to:%s] The owner sent this to %s on the "
-                        "standby machine, which already has it. Read-only copy: no reply "
-                        "needed.\n%s" % (target, name, text))
+        self.inbox.note("tg:%d" % update_id, _note_body(
+            "[FYI routed-to:%s] The owner sent this to %s on the standby machine, which already "
+            "has it. Read-only copy: no reply needed.\n%s" % (target, name,
+                                                               _with_origin(message, text))))
         self._mark_handled(update_id)
 
     def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
@@ -2080,7 +2146,7 @@ class Bridge:
             if thread is not None else None
         if topic:
             text = "[topic:%s] %s" % (topic, text)
-        note = self.inbox.note("tg:%d" % update_id, text)
+        note = self.inbox.note("tg:%d" % update_id, _note_body(text))
         if isinstance(note, str):  # Compatibility with an Inbox test double.
             note = Note(note)
         note_id = note.id
@@ -2361,7 +2427,7 @@ class Standby(Bridge):
 
     def _submit(self, update_id: int, text: str, receipt: str = RECEIPT,
                 message: Optional[dict[str, Any]] = None) -> None:
-        note = self.inbox.note("tg:%d" % update_id, text)
+        note = self.inbox.note("tg:%d" % update_id, _note_body(text))
         note_id = note if isinstance(note, str) else note.id  # str: an Inbox test double.
         self._mark_handled(update_id)
         message_id = (message or {}).get("message_id")
