@@ -63,7 +63,7 @@ export FM_TELEGRAM_PANE=w1:p1 FM_TELEGRAM_LOOP='while true; do …; done'   # fo
 
 `FM_TELEGRAM_LABEL`, `FM_TELEGRAM_DATA_DIR`, `FM_TELEGRAM_STATE_DIR`, `FM_TELEGRAM_MATCH` (poller command-line pattern, default `fm_telegram.py run`) and `FM_TELEGRAM_WAIT_NOTE` (seconds, default 300) override the defaults.
 
-After the cutover, redeploy a new revision with the same `install.sh --launchd --python …` from the new checkout; it switches `current` and restarts the agent. Read the log at `~/Library/Logs/fm-telegram.log`.
+After the cutover, redeploy a new revision with the same `install.sh --launchd --python …` from the new checkout; it switches `current` and restarts the agent. It waits for `bootout` to finish before `bootstrap` (retried up to 5 times), then checks the agent has a pid and `kickstart`s it if not; it exits non-zero if the agent still is not running, so no manual `launchctl kickstart -k` is needed. Read the log at `~/Library/Logs/fm-telegram.log`.
 
 The systemd unit has conservative process isolation only. A stricter filesystem sandbox cannot be enabled generically because `fm-inbox.sh` must write the mounted Firstmate home.
 
