@@ -11,11 +11,20 @@ LABEL = "io.example.fm-telegram"
 
 # Each fake records its arguments in $FAKE/calls; $FAKE holds the state they read.
 FAKES = {
+    # $FAKE/lag: prints that still see the job after bootout; $FAKE/refuse: bootstraps that
+    # fail anyway; $FAKE/idle: bootstrap loads without a pid; $FAKE/dead: kickstart starts nothing.
     "launchctl": """
+tick() { n=$(cat "$FAKE/$1" 2>/dev/null || echo 0); [ "$n" -gt 0 ] && echo $((n - 1)) > "$FAKE/$1"; }
 case "$1" in
-  print) [ -f "$FAKE/loaded" ] || exit 113; printf '\\tpid = %s\\n' "$(cat "$FAKE/loaded")" ;;
-  bootout) rm -f "$FAKE/loaded" ;;
-  bootstrap) echo 4242 > "$FAKE/loaded" ;;
+  print)
+    [ -f "$FAKE/out" ] && ! tick lag && rm -f "$FAKE/out"
+    [ -f "$FAKE/loaded" ] || [ -f "$FAKE/out" ] || exit 113
+    pid=$(cat "$FAKE/loaded" 2>/dev/null); [ -z "$pid" ] || printf '\\tpid = %s\\n' "$pid" ;;
+  bootout) [ -f "$FAKE/loaded" ] && [ -f "$FAKE/lag" ] && touch "$FAKE/out"; rm -f "$FAKE/loaded" ;;
+  bootstrap)
+    if [ -f "$FAKE/out" ] || tick refuse; then echo "Bootstrap failed: 5" >&2; exit 5; fi
+    [ -f "$FAKE/idle" ] && : > "$FAKE/loaded" || echo 4242 > "$FAKE/loaded" ;;
+  kickstart) [ -f "$FAKE/dead" ] || echo 4343 > "$FAKE/loaded" ;;
 esac""",
     # -f lists the pollers; -P <shell> -x sleep finds the loop's sleep (none here).
     "pgrep": 'case "$1" in -f) cat "$FAKE/pollers" 2>/dev/null ;; esac; exit 0',
@@ -96,8 +105,56 @@ class DeployTests(unittest.TestCase):
         self.assertEqual([str(python), "%s/current/fm_telegram.py" % self.data, "run"],
                          agent["ProgramArguments"])
         self.assertEqual("Standard", agent["ProcessType"])
-        self.assertEqual(["bootout gui/%d/%s" % (os.getuid(), LABEL),
-                          "bootstrap gui/%d %s" % (os.getuid(), self.plist)], self.calls("launchctl"))
+        domain = "gui/%d" % os.getuid()
+        self.assertEqual(["bootout %s/%s" % (domain, LABEL), "print %s/%s" % (domain, LABEL),
+                          "bootstrap %s %s" % (domain, self.plist), "print %s/%s" % (domain, LABEL),
+                          "print %s/%s" % (domain, LABEL)], self.calls("launchctl"))
+        self.assertIn("reconciled LaunchAgent %s (pid 4242)" % LABEL, result.stdout)
+
+    def install_launchd(self):
+        return self.run_script("install.sh", "--version", "v1", "--launchd")
+
+    def test_install_waits_for_a_slow_bootout_before_bootstrapping(self):
+        self.state(loaded="4242", lag="3")  # launchd still lists the old job for 3 prints
+        result = self.install_launchd()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn("Bootstrap failed", result.stderr)
+        self.assertEqual(1, sum(c.startswith("bootstrap") for c in self.calls("launchctl")))
+        self.assertIn("(pid 4242)", result.stdout)
+
+    def test_install_retries_a_failed_bootstrap(self):
+        self.state(refuse="2")
+        result = self.install_launchd()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(3, sum(c.startswith("bootstrap") for c in self.calls("launchctl")))
+        self.assertIn("retrying (2/5)", result.stderr)
+
+    def test_install_fails_loudly_when_bootstrap_keeps_failing(self):
+        self.state(refuse="99")
+        result = self.install_launchd()
+        self.assertEqual(1, result.returncode)
+        self.assertEqual(5, sum(c.startswith("bootstrap") for c in self.calls("launchctl")))
+        self.assertIn("failed 5 times; the agent is not running", result.stderr)
+
+    def test_install_fails_when_bootout_never_finishes(self):
+        self.state(loaded="4242", lag="999")
+        result = self.install_launchd()
+        self.assertEqual(1, result.returncode)
+        self.assertIn("still loaded 30s after bootout", result.stderr)
+        self.assertFalse(any(c.startswith("bootstrap") for c in self.calls("launchctl")))
+
+    def test_install_kickstarts_an_agent_left_without_a_pid(self):
+        self.state(idle="")
+        result = self.install_launchd()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("kickstart -k gui/%d/%s" % (os.getuid(), LABEL), self.calls("launchctl"))
+        self.assertIn("(pid 4343)", result.stdout)
+
+    def test_install_fails_when_the_agent_will_not_start(self):
+        self.state(idle="", dead="")
+        result = self.install_launchd()
+        self.assertEqual(1, result.returncode)
+        self.assertIn("is loaded but not running", result.stderr)
 
     def test_check_passes_with_one_poller_under_a_shell(self):
         self.state(pollers="4242\n")

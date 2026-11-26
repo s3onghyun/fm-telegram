@@ -105,9 +105,32 @@ case "$service" in
     mkdir -p "$logs"
     render "$root/deploy/launchd/fm-telegram.plist" "$plist" "$app_dir" "$logs"
     chmod 644 "$plist"
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$plist"
-    echo "reconciled LaunchAgent $label"
+    domain="gui/$(id -u)"
+    loaded() { launchctl print "$domain/$label" >/dev/null 2>&1; }
+    agent_pid() { launchctl print "$domain/$label" 2>/dev/null | awk '$1 == "pid" { print $3; exit }'; }
+    wait_until() {  # <seconds> <command...>: poll once a second
+      n=$1; shift
+      while [ "$n" -gt 0 ]; do "$@" && return 0; n=$((n - 1)); sleep 1; done
+      "$@"
+    }
+    unloaded() { ! loaded; }
+    running() { [ -n "$(agent_pid)" ]; }
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    # bootout returns before launchd forgets the job; bootstrapping too early fails with
+    # "Bootstrap failed: 5" and leaves the agent stopped.
+    wait_until 30 unloaded || { echo "$0: LaunchAgent $label still loaded 30s after bootout" >&2; exit 1; }
+    attempt=1
+    until launchctl bootstrap "$domain" "$plist"; do
+      [ "$attempt" -lt 5 ] || { echo "$0: launchctl bootstrap $label failed $attempt times; the agent is not running" >&2; exit 1; }
+      echo "bootstrap of $label failed; retrying ($attempt/5)" >&2
+      attempt=$((attempt + 1)); sleep 2
+    done
+    if ! wait_until 10 running; then
+      echo "LaunchAgent $label has no pid after bootstrap; kickstarting" >&2
+      launchctl kickstart -k "$domain/$label" || true
+      wait_until 10 running || { echo "$0: LaunchAgent $label is loaded but not running; see $logs/fm-telegram.log" >&2; exit 1; }
+    fi
+    echo "reconciled LaunchAgent $label (pid $(agent_pid))"
     ;;
   systemd)
     command -v systemctl >/dev/null 2>&1 || { echo "$0: --systemd requires systemctl" >&2; exit 1; }
