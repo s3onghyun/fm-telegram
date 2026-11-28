@@ -141,17 +141,19 @@ class SetupTests(unittest.TestCase):
         self.assertIn("setup owner need-human:", output)
 
     def test_prompted_token_is_hidden_verified_and_kept_out_of_argv_and_output(self):
-        runner, prompts = FakeRunner(), iter(["not-a-token", "999999:" + "x" * 35, TOKEN])
-        code, output = self.setup(self.args(token_only=True), interactive=True, runner=runner,
-                                  platform="darwin", secret=lambda _prompt: next(prompts))
-        self.assertEqual(0, code, output)
-        self.assertEqual(TOKEN, runner.stored)
-        self.assertEqual(2, output.count("setup token retry"))
-        self.assertTrue(all(TOKEN not in " ".join(args) for args, _input in runner.calls))
-        self.assertNotIn(TOKEN, output)
-        # A rerun uses the stored token and asks for nothing.
-        code, output = self.setup(self.args(token_only=True), runner=runner, platform="darwin")
-        self.assertEqual(0, code, output)
+        # store_token on macOS reads $USER; pin it so the test does not depend on the caller's environment.
+        with patch.dict(os.environ, {"USER": "tester"}):
+            runner, prompts = FakeRunner(), iter(["not-a-token", "999999:" + "x" * 35, TOKEN])
+            code, output = self.setup(self.args(token_only=True), interactive=True, runner=runner,
+                                      platform="darwin", secret=lambda _prompt: next(prompts))
+            self.assertEqual(0, code, output)
+            self.assertEqual(TOKEN, runner.stored)
+            self.assertEqual(2, output.count("setup token retry"))
+            self.assertTrue(all(TOKEN not in " ".join(args) for args, _input in runner.calls))
+            self.assertNotIn(TOKEN, output)
+            # A rerun uses the stored token and asks for nothing.
+            code, output = self.setup(self.args(token_only=True), runner=runner, platform="darwin")
+            self.assertEqual(0, code, output)
 
     def test_linux_token_goes_to_private_runtime_env_read_by_the_bridge(self):
         runner = FakeRunner(keychain=False)
