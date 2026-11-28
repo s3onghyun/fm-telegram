@@ -411,6 +411,10 @@ curl localhost:18765/_control/sent
 
 `fm-inbox.sh list` in your Firstmate home now shows the `hi` note.
 
+## Contributing
+
+Start with an [open `good first issue`](https://github.com/s3onghyun/fm-telegram/issues?q=is%3Aopen+label%3A%22good+first+issue%22): each lists the files, commands, done criteria and size. Comment on the issue to claim it and we assign it to you. Run `python3 -m unittest discover -s tests -v` before opening a pull request; CI runs the same command on Ubuntu and macOS for every pull request, including forks. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Tested
 
 Last run 2026-10-17 on macOS (Apple Silicon, Python 3.8), following only this README in a throwaway home, with a fake Bot API instead of Telegram and no real token:
